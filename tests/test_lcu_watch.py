@@ -235,11 +235,35 @@ def test_draft_leaves_pick_on_unconfigured_lane(run):
     assert conn.patches() == []
 
 
-def test_draft_does_nothing_in_aram(run):
-    _arm(mode="aram")
+def test_is_aram_session_reads_bench_flag():
+    assert lcu_watch.is_aram_session({"benchEnabled": True}) is True
+    assert lcu_watch.is_aram_session({"benchEnabled": False}) is False
+    assert lcu_watch.is_aram_session({}) is False  # draft session: no bench
+
+
+def test_draft_skips_aram_session_regardless_of_mode(run):
+    # The gate is the *session* (benchEnabled = ARAM), not the configured mode:
+    # even a flex-mode autopilot must not draft an ARAM bench session.
+    _arm(mode="flex")
     conn = FakeConnection()
-    run(lcu_watch.run_draft(conn, _ban_session()))
+    session = _ban_session()
+    session["benchEnabled"] = True
+    run(lcu_watch.run_draft(conn, session))
     assert conn.patches() == []
+
+
+def test_draft_runs_for_draft_session_even_when_watch_only(run):
+    # Watch-only (start=False) and a queue we didn't pick via --mode must still
+    # auto-draft a normal draft session: the gate is the session, not start/mode.
+    lcu_watch.AUTOPILOT = lcu_watch.Autopilot(
+        mode="solo", lanes={"JUNGLE": [35, 233]}, lane_order=["JUNGLE"],
+        bans=[64, 238], start=False,
+    )
+    conn = FakeConnection()
+    run(lcu_watch.run_draft(conn, _ban_session()))  # no benchEnabled -> drafts
+    assert conn.patches() == [
+        ("/lol-champ-select/v1/session/actions/10", {"championId": 64, "completed": True})
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -330,6 +354,22 @@ def test_ready_check_ignores_already_accepted(run):
     conn = FakeConnection()
     run(lcu_watch.maybe_accept_ready_check(conn, {"state": "InProgress", "playerResponse": "Accepted"}))
     assert conn.posts() == []
+
+
+def test_stop_queue_deletes_search(run):
+    calls = []
+
+    def handler(method, endpoint, body):
+        calls.append((method, endpoint))
+        return FakeResponse(204)
+
+    assert run(lcu_watch.stop_queue(FakeConnection(handler))) is True
+    assert ("delete", "/lol-lobby/v2/lobby/matchmaking/search") in calls
+
+
+def test_stop_queue_false_when_nothing_to_cancel(run):
+    conn = FakeConnection(lambda m, e, b: FakeResponse(404))
+    assert run(lcu_watch.stop_queue(conn)) is False  # reported, not raised
 
 
 def test_ready_check_respects_runtime_auto_accept_toggle(run, monkeypatch):

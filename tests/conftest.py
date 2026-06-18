@@ -70,4 +70,9 @@ def reset_lcu_state():
     lcu_watch._champ_names.clear()
     lcu_watch._spell_names.clear()
     lcu_watch.AUTOPILOT = None
+    lcu_watch.CONNECTION = None
     yield
+    # Tests that install a custom event sink should leave the default one behind.
+    from src import events
+
+    events.reset_sink()
