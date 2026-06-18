@@ -62,3 +62,14 @@ def local_assigned_position(session: dict) -> str:
 def assigned_lane(session: dict) -> str:
     """The local player's assigned position, canonicalised (e.g. MIDDLE)."""
     return local_assigned_position(session).upper()
+
+
+def is_aram_session(session: dict) -> bool:
+    """True if this champ-select session is ARAM-style (no lanes/bans to draft).
+
+    ARAM has no per-lane pick/ban actions for the autopilot to drive; the client
+    signals it with ``benchEnabled`` (the reroll/bench mechanic is ARAM-only).
+    Used to gate run_draft off the *session* rather than the configured queue,
+    so a watch-only draft game auto-drafts regardless of which queue was joined.
+    """
+    return bool(session.get("benchEnabled"))

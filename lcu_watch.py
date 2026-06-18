@@ -57,9 +57,11 @@ from src import champ_select as _champ_select
 from src import cli as _cli
 from src import constants as _constants
 from src import display as _display
+from src import events as _events
 from src import handlers as _handlers
 from src import http as _http
 from src import lobby as _lobby
+from src import manual as _manual
 from src import state as _state
 from src.cli import main
 
@@ -77,10 +79,12 @@ _SOURCES = (
     _state,         # STATE, AUTOPILOT, _champ_names, _spell_names, ChampSelectState
     _build,         # set_runes, set_spells, current_game_mode, apply_build, ...
     _constants,     # AUTO_ACCEPT, AUTO_APPLY, REGION, queue ids, SummonerSpell, ...
+    _events,        # EventSink, set_sink, emit, Update dataclasses (defines them)
     _champ_select,
     _display,
     _lobby,
     _autopilot,
+    _manual,
     _handlers,
     _cli,
 )

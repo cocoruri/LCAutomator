@@ -5,7 +5,7 @@ import asyncio
 import sys
 
 from src import state
-from src.constants import LANE_ALIASES
+from src.autopilot import UnknownLaneError, make_autopilot
 from src.display import opgg_runes
 from src.handlers import connector
 from src.state import Autopilot
@@ -23,40 +23,19 @@ def _resolve_champion(name: str) -> tuple[int, str]:
 
 
 def build_autopilot(args) -> Autopilot:
-    lanes: dict[str, list[int]] = {}
-    lane_order: list[str] = []
-    lane_names: dict[str, list[str]] = {}
-    for position, champ1, champ2 in args.lane or []:
-        canon = LANE_ALIASES.get(position.lower())
-        if not canon:
-            raise SystemExit(f"Unknown lane {position!r}. Use one of {sorted(set(LANE_ALIASES))}.")
-        if canon in lanes:
-            raise SystemExit(f"Lane {canon} given twice.")
-        ids, names = [], []
-        for cname in (champ1, champ2):
-            cid, disp = _resolve_champion(cname)
-            ids.append(cid)
-            names.append(disp)
-        lanes[canon] = ids
-        lane_names[canon] = names
-        lane_order.append(canon)
-
-    bans: list[int] = []
-    ban_names: list[str] = []
-    for cname in args.ban or []:
-        cid, disp = _resolve_champion(cname)
-        bans.append(cid)
-        ban_names.append(disp)
-
-    return Autopilot(
-        mode=args.mode,
-        lanes=lanes,
-        lane_order=lane_order,
-        bans=bans,
-        start=not args.no_start,
-        lane_names=lane_names,
-        ban_names=ban_names,
-    )
+    # Reuse the headless builder; translate its lane error into the CLI's
+    # SystemExit so argument-validation behavior is unchanged.
+    lanes = [(position, [champ1, champ2]) for position, champ1, champ2 in (args.lane or [])]
+    try:
+        return make_autopilot(
+            args.mode,
+            lanes=lanes,
+            bans=list(args.ban or []),
+            start=not args.no_start,
+            resolve=_resolve_champion,
+        )
+    except UnknownLaneError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def parse_args(argv=None):

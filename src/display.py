@@ -8,6 +8,7 @@ from src.constants import (
     UNRANKED_SORT_KEY,
 )
 from src.endpoints import Endpoints
+from src.events import ChampSelectView, PlayerView
 from src.state import _champ_names, _spell_names
 
 
@@ -115,6 +116,61 @@ def print_champ_select(session: dict) -> None:
     enemy = [c for c in enemy if c]
     if enemy:
         print("Enemy picks (revealed): " + ", ".join(enemy))
+
+
+def _player_view(player: dict, is_me: bool) -> PlayerView:
+    """A render-ready PlayerView for one champ-select cell.
+
+    A locked championId beats a hover (championPickIntent), mirroring player_line.
+    """
+    pos = (player.get("assignedPosition") or "").lower()
+    pos_label = LCU_TO_OPGG.get(pos, pos or "?")
+    locked_id = player.get("championId")
+    name = champ_name(locked_id) or champ_name(player.get("championPickIntent"))
+    return PlayerView(
+        position=pos_label,
+        champion=name,
+        locked=bool(champ_name(locked_id)),
+        is_me=is_me,
+    )
+
+
+def _ban_names(ban_ids) -> tuple[str, ...]:
+    """Resolve a list of banned champion ids to names, dropping empties."""
+    return tuple(n for n in (champ_name(b) for b in (ban_ids or [])) if n)
+
+
+def build_champ_select_view(session: dict) -> ChampSelectView:
+    """A name-resolved, render-ready snapshot of a champ-select session.
+
+    The single transform both front ends use: it reuses the pure champ_select
+    readers + the name lookups above so neither the CLI nor the GUI reparses a
+    raw session. print_champ_select renders the console form; the GUI renders
+    widgets from the same view.
+    """
+    champ_id, locked = local_pick(session)
+    cell = session.get("localPlayerCellId")
+    my_team = sorted(
+        session.get("myTeam", []),
+        key=lambda p: POSITION_ORDER.get(
+            (p.get("assignedPosition") or "").lower(), UNRANKED_SORT_KEY
+        ),
+    )
+    bans = session.get("bans") or {}
+    return ChampSelectView(
+        your_pick=champ_name(champ_id),
+        your_pick_locked=locked,
+        my_team=tuple(
+            _player_view(p, is_me=p.get("cellId") == cell) for p in my_team
+        ),
+        enemy_champions=tuple(
+            n
+            for n in (champ_name(p.get("championId")) for p in session.get("theirTeam", []))
+            if n
+        ),
+        my_bans=_ban_names(bans.get("myTeamBans")),
+        their_bans=_ban_names(bans.get("theirTeamBans")),
+    )
 
 
 def queue_label(queue_id, game_mode: str = "") -> str:

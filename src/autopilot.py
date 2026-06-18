@@ -3,6 +3,7 @@ from __future__ import annotations
 from src import state
 from src.champ_select import (
     assigned_lane,
+    is_aram_session,
     local_action_in_progress,
     unavailable_champions,
 )
@@ -24,8 +25,70 @@ from src.lobby import fetch_available_queues, get_lobby_members
 from src.state import Autopilot
 
 
+class UnknownLaneError(Exception):
+    """Raised by make_autopilot when a lane name isn't a known alias."""
+
+
 class QueueNotAvailableError(Exception):
     """Raised by setup_queue when no lobby could be created for the requested mode."""
+
+
+def make_autopilot(
+    mode: str,
+    *,
+    lanes: list[tuple[str, list[str]]] | None = None,
+    bans: list[str] | None = None,
+    start: bool = True,
+    resolve,
+) -> Autopilot:
+    """Build an Autopilot from plain inputs (no argparse).
+
+    Shared by the CLI (from parsed args) and the GUI (from widgets): both pass a
+    `resolve(name) -> (id, display)` callback (the champion-name lookup) so this
+    stays free of any opgg_runes import. The GUI's "auto-start party" checkbox is
+    just `start`; unchecked = watch-only (the CLI's --no-start), still pick/ban.
+
+    `lanes` is [(position_alias, [champ_name, ...]), ...]; raises UnknownLaneError
+    on a bad alias rather than silently dropping a lane (decide-or-fail).
+    """
+    from src.constants import LANE_ALIASES  # local: avoid a constants import churn
+
+    lane_ids: dict[str, list[int]] = {}
+    lane_order: list[str] = []
+    lane_names: dict[str, list[str]] = {}
+    for position, champs in lanes or []:
+        canon = LANE_ALIASES.get(position.lower())
+        if not canon:
+            raise UnknownLaneError(
+                f"Unknown lane {position!r}. Use one of {sorted(set(LANE_ALIASES))}."
+            )
+        if canon in lane_ids:
+            raise UnknownLaneError(f"Lane {canon} given twice.")
+        ids, names = [], []
+        for cname in champs:
+            cid, disp = resolve(cname)
+            ids.append(cid)
+            names.append(disp)
+        lane_ids[canon] = ids
+        lane_names[canon] = names
+        lane_order.append(canon)
+
+    ban_ids: list[int] = []
+    ban_names: list[str] = []
+    for cname in bans or []:
+        cid, disp = resolve(cname)
+        ban_ids.append(cid)
+        ban_names.append(disp)
+
+    return Autopilot(
+        mode=mode,
+        lanes=lane_ids,
+        lane_order=lane_order,
+        bans=ban_ids,
+        start=start,
+        lane_names=lane_names,
+        ban_names=ban_names,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -109,6 +172,17 @@ async def setup_queue(connection, ap: Autopilot) -> None:
         print(f"  (warn) could not start search: HTTP {resp.status}")
 
 
+async def stop_queue(connection) -> bool:
+    """Cancel matchmaking -- the inverse of setup_queue's search start.
+
+    DELETE on the matchmaking search endpoint stops queueing (the lobby stays).
+    Returns True on success. A non-2xx (e.g. nothing was searching) is reported
+    by the caller, not raised, so "disarm" is always safe to invoke.
+    """
+    resp = await connection.request("delete", Endpoints.LOBBY_SEARCH)
+    return ok(resp.status)
+
+
 # --------------------------------------------------------------------------- #
 # Autopilot: drafting (ranked ban / pick)
 # --------------------------------------------------------------------------- #
@@ -144,9 +218,15 @@ async def attempt_action(connection, action: dict, champion_id: int, verb: str) 
 
 
 async def run_draft(connection, session: dict) -> None:
-    """Auto-ban and auto-pick in ranked, per the configured preferences."""
+    """Auto-ban and auto-pick in a draft, per the configured preferences.
+
+    Gated on the *session*, not the configured queue: any draft with ban/pick
+    actions for us drafts as long as an Autopilot is armed (so watch-only / a
+    queue we didn't pick via --mode still auto-drafts). ARAM is skipped because
+    it has no lanes/bans to drive (see is_aram_session).
+    """
     ap = state.AUTOPILOT
-    if ap is None or ap.is_aram:
+    if ap is None or is_aram_session(session):
         return
     # During the opening phases ("GAME_STARTING" then "PLANNING", where players
     # only declare pick intent) the ban action is already flagged in-progress,

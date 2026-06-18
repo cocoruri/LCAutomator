@@ -12,12 +12,23 @@ from src.constants import (
     READY_CHECK_NO_RESPONSE,
 )
 from src.display import (
+    build_champ_select_view,
     load_static,
     print_champ_select,
     queue_label,
     summarize,
 )
 from src.endpoints import Endpoints
+from src.events import (
+    ChampSelectEndedUpdate,
+    ChampSelectUpdate,
+    ConnectedUpdate,
+    DisconnectedUpdate,
+    NoticeUpdate,
+    PhaseUpdate,
+    SummonerInfo,
+    emit,
+)
 from src.http import ok
 
 connector = Connector()
@@ -77,7 +88,9 @@ async def print_lobby(connection) -> bool:
         return False
     lobby = await resp.json()
     cfg = lobby.get("gameConfig") or {}
-    print(f"  Current phase: Lobby ({queue_label(cfg.get('queueId'), cfg.get('gameMode'))})")
+    label = queue_label(cfg.get("queueId"), cfg.get("gameMode"))
+    print(f"  Current phase: Lobby ({label})")
+    emit(PhaseUpdate(phase=f"Lobby ({label})"))
 
     members = lobby.get("members") or []
     local_id = _identity(lobby.get("localMember") or {})
@@ -92,19 +105,24 @@ async def print_lobby(connection) -> bool:
 
 @connector.ready
 async def on_ready(connection):
+    state.CONNECTION = connection  # let the GUI act on the client after connect
     print("Connected to the League client.")
     await load_static(connection)
 
     resp = await connection.request("get", Endpoints.CURRENT_SUMMONER)
+    summoner = None
     if ok(resp.status):
         me = await resp.json()
         who = _display_name(me) or "?"
         print(f"  Logged in as {who} (level {me.get('summonerLevel')})")
+        summoner = SummonerInfo(name=who, level=me.get("summonerLevel"))
+    emit(ConnectedUpdate(summoner=summoner))
 
     resp = await connection.request("get", Endpoints.GAMEFLOW_PHASE)
     phase = await resp.json() if ok(resp.status) else None
     if phase != PHASE_LOBBY or not await print_lobby(connection):
         print(f"  Current phase: {phase}")
+        emit(PhaseUpdate(phase=phase))
 
     # If we connected mid-ready-check, handle it right away.
     resp = await connection.request("get", Endpoints.READY_CHECK)
@@ -118,16 +136,20 @@ async def on_ready(connection):
             await setup_queue(connection, state.AUTOPILOT)
         except QueueNotAvailableError as exc:
             print(f"  (error) {exc}")
+            emit(NoticeUpdate(text=str(exc), level="error"))
 
 
 @connector.close
 async def on_close(_):
+    state.CONNECTION = None
     print("Client closed - stopping watcher.")
+    emit(DisconnectedUpdate())
 
 
 @connector.ws.register(Endpoints.GAMEFLOW_PHASE, event_types=("CREATE", "UPDATE"))
 async def on_phase(connection, event):
     print(f"[phase] -> {event.data}")
+    emit(PhaseUpdate(phase=event.data))
 
 
 @connector.ws.register(Endpoints.READY_CHECK, event_types=("CREATE", "UPDATE"))
@@ -144,6 +166,7 @@ async def on_champ_select(connection, event):
     if snapshot != state.STATE.last_snapshot:  # the session fires constantly; only
         state.STATE.last_snapshot = snapshot  # print when something actually changed
         print_champ_select(session)
+        emit(ChampSelectUpdate(view=build_champ_select_view(session)))
 
     # Auto-ban / auto-pick first (locking a pick is what triggers auto-apply).
     await run_draft(connection, session)
@@ -162,3 +185,4 @@ async def on_champ_select(connection, event):
 async def on_champ_select_end(connection, event):
     state.STATE.reset()
     print("Champ select ended.\n")
+    emit(ChampSelectEndedUpdate())

@@ -46,3 +46,7 @@ _champ_names: dict[int, str] = {}  # championId -> display name; cached on conne
 _spell_names: dict[int, str] = {}  # summonerSpellId -> display name; cached on connect, read by every handler
 STATE = ChampSelectState()  # per-session draft/apply bookkeeping, mutated from champ-select handlers
 AUTOPILOT: Autopilot | None = None  # CLI config set once in main(), read by the queue/draft handlers
+CONNECTION = None  # the live lcu-driver connection while connected; set on_ready, cleared on_close.
+# Lets a front end (the GUI) run a coroutine against the client after connect --
+# e.g. start the queue when the user arms an auto-start config mid-session, since
+# on_ready only runs setup_queue at connect time.
