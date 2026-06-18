@@ -132,8 +132,9 @@ Distribution is a PyInstaller build, not a wheel. `lcu_watch.spec` analyzes
 - Keep `src/` imports explicit/static (as the shim does). Don't introduce dynamic
   `importlib`-style loading of `src.*` without adding it to the spec `hiddenimports`.
 - Build: `pyinstaller lcu_watch.spec` → `dist/lcu_watch/`.
-- Data location (planned, `TODO.md` item 1): a `.portable` marker next to the exe/
-  script selects a local `.cache/`; otherwise use the user home cache.
+- Data location: `opgg_runes.resolve_cache_dir()` caches under `~/.cache/lcu_automator`,
+  or in a `.cache/` next to the app when a `.portable` marker file is present
+  (`_app_dir()` resolves the PyInstaller exe dir when frozen, else the script dir).
 
 ## Commands
 

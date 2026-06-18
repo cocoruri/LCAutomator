@@ -39,7 +39,9 @@ pip install -r requirements.txt        # runtime (lcu-driver)
 pip install -r requirements-dev.txt    # + pytest, to run the tests
 ```
 
-`opgg_runes.py` caches champion/perk/meta data under `.cache/` on first run.
+`opgg_runes.py` caches champion/perk/meta data on first run. By default it lives
+under `~/.cache/lcu_automator`; drop an empty `.portable` file next to the app
+(exe or script) to keep everything self-contained in a `.cache/` folder there.
 
 ## opgg_runes.py
 

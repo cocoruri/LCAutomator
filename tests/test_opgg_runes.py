@@ -1,6 +1,7 @@
 """Tests for the pure build-mapping logic in opgg_runes."""
 
 import json
+import os
 import urllib.error
 
 import pytest
@@ -235,6 +236,31 @@ def test_fetch_build_positionless_label_is_mode(monkeypatch):
         lambda url: {"data": {"runes": [RAW_RUNE], "summoner_spells": []}},
     )
     assert opgg_runes.fetch_build(64, "none", mode="aram").position == "aram"
+
+
+# --- cache location: portable marker vs home [TODO #1] ---------------------- #
+def test_app_dir_uses_executable_when_frozen(monkeypatch, tmp_path):
+    exe = tmp_path / "bin" / "lcu_watch.exe"
+    exe.parent.mkdir()
+    monkeypatch.setattr(opgg_runes.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(opgg_runes.sys, "executable", str(exe))
+    assert opgg_runes._app_dir() == str(exe.parent)
+
+
+def test_resolve_cache_dir_portable(monkeypatch, tmp_path):
+    # A `.portable` marker next to the app -> a self-contained `.cache/` there.
+    monkeypatch.setattr(opgg_runes, "_app_dir", lambda: str(tmp_path))
+    (tmp_path / opgg_runes.PORTABLE_MARKER).write_text("")
+    assert opgg_runes.resolve_cache_dir() == str(tmp_path / ".cache")
+
+
+def test_resolve_cache_dir_home_when_not_portable(monkeypatch, tmp_path):
+    # No marker -> ~/.cache/lcu_automator.
+    app, home = tmp_path / "app", tmp_path / "home"
+    app.mkdir()
+    monkeypatch.setattr(opgg_runes, "_app_dir", lambda: str(app))
+    monkeypatch.setattr(opgg_runes.os.path, "expanduser", lambda p: str(home))
+    assert opgg_runes.resolve_cache_dir() == os.path.join(str(home), ".cache", "lcu_automator")
 
 
 # --- reference-data caching [TO_FIX #11] ------------------------------------ #

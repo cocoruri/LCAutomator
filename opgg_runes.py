@@ -36,8 +36,32 @@ from typing import Any, Callable
 
 USER_AGENT = "Mozilla/5.0 (opgg-runes script)"
 
-# Reference data (champions, perks) is cached here so we only download it once.
-CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+# Reference data (champions, perks) is cached on disk so we only download it once.
+PORTABLE_MARKER = ".portable"
+APP_NAME = "lcu_automator"
+
+
+def _app_dir() -> str:
+    """Directory the app runs from: the PyInstaller exe, else this script."""
+    base = sys.executable if getattr(sys, "frozen", False) else __file__
+    return os.path.dirname(os.path.abspath(base))
+
+
+def resolve_cache_dir() -> str:
+    """Where reference data is cached.
+
+    Portable mode: if a `.portable` marker sits next to the app, cache in a
+    `.cache/` folder right there, so the whole thing is self-contained (e.g. on a
+    USB stick). Otherwise cache under the user's home: ~/.cache/lcu_automator.
+    The choice is deterministic -- the marker is either present or it isn't.
+    """
+    app_dir = _app_dir()
+    if os.path.exists(os.path.join(app_dir, PORTABLE_MARKER)):
+        return os.path.join(app_dir, ".cache")
+    return os.path.join(os.path.expanduser("~"), ".cache", APP_NAME)
+
+
+CACHE_DIR = resolve_cache_dir()
 CHAMPIONS_CACHE = os.path.join(CACHE_DIR, "champions.json")
 PERKS_CACHE = os.path.join(CACHE_DIR, "perks.json")
 META_CACHE = os.path.join(CACHE_DIR, "meta.json")
