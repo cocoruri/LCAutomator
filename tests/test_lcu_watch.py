@@ -245,34 +245,61 @@ def test_draft_does_nothing_in_aram(run):
 # --------------------------------------------------------------------------- #
 # Queue setup (async)
 # --------------------------------------------------------------------------- #
-def test_queue_candidates_ranked(run):
-    assert run(lcu_watch.queue_candidates(FakeConnection(), "solo")) == [lcu_watch.QUEUE_SOLO]
-    assert run(lcu_watch.queue_candidates(FakeConnection(), "flex")) == [lcu_watch.QUEUE_FLEX]
-
-
-def test_queue_candidates_aram_prefers_mayhem_then_fallback(run):
+def _queues_handler(*queue_ids_available):
+    """Handler that reports the given queue ids as Available, all others absent."""
+    available = {qid for qid in queue_ids_available}
     def handler(method, endpoint, body):
         if "game-queues" in endpoint:
             return FakeResponse(200, [
-                {"id": lcu_watch.QUEUE_ARAM_MAYHEM, "name": "ARAM Mayhem", "description": "", "queueAvailability": "Available"},
-                {"id": lcu_watch.QUEUE_ARAM, "name": "ARAM", "description": "", "queueAvailability": "Available"},
+                {"id": qid, "queueAvailability": "Available"} for qid in available
             ])
         return None
+    return handler
 
-    assert run(lcu_watch.queue_candidates(FakeConnection(handler), "aram")) == [
+
+def test_fetch_available_queues_filters_disabled(run):
+    def handler(method, endpoint, body):
+        if "game-queues" in endpoint:
+            return FakeResponse(200, [
+                {"id": 420, "queueAvailability": "Available"},
+                {"id": 440, "queueAvailability": "PlatformDisabled"},
+                {"id": 450, "queueAvailability": "Available"},
+            ])
+        return None
+    result = run(lcu_watch.fetch_available_queues(FakeConnection(handler)))
+    assert [q["id"] for q in result] == [420, 450]
+
+
+def test_queue_candidates_ranked(run):
+    solo_conn = FakeConnection(_queues_handler(lcu_watch.QUEUE_SOLO))
+    flex_conn = FakeConnection(_queues_handler(lcu_watch.QUEUE_FLEX))
+    assert run(lcu_watch.queue_candidates(solo_conn, "solo")) == [lcu_watch.QUEUE_SOLO]
+    assert run(lcu_watch.queue_candidates(flex_conn, "flex")) == [lcu_watch.QUEUE_FLEX]
+
+
+def test_queue_candidates_ranked_disabled_returns_empty(run):
+    conn = FakeConnection(_queues_handler())  # no queues available
+    assert run(lcu_watch.queue_candidates(conn, "solo")) == []
+
+
+def test_queue_candidates_aram_both_available(run):
+    conn = FakeConnection(_queues_handler(lcu_watch.QUEUE_ARAM_MAYHEM, lcu_watch.QUEUE_ARAM))
+    # Mayhem comes first (MODE_QUEUES order), plain ARAM as fallback.
+    assert run(lcu_watch.queue_candidates(conn, "aram")) == [
         lcu_watch.QUEUE_ARAM_MAYHEM, lcu_watch.QUEUE_ARAM
     ]
+
+
+def test_queue_candidates_aram_mayhem_disabled(run):
+    # When Mayhem is not in the available set, only plain ARAM is returned.
+    conn = FakeConnection(_queues_handler(lcu_watch.QUEUE_ARAM))
+    assert run(lcu_watch.queue_candidates(conn, "aram")) == [lcu_watch.QUEUE_ARAM]
 
 
 def test_set_role_prefs_full_stack_single_role(run):
     _arm(lanes={"JUNGLE": [35, 233], "MIDDLE": [103, 99]})
 
-    def handler(method, endpoint, body):
-        if endpoint == "/lol-lobby/v2/lobby" and method == "get":
-            return FakeResponse(200, {"members": [{}] * 5})
-        return None
-
-    conn = FakeConnection(handler)
+    conn = FakeConnection(_members_handler(5))
     run(lcu_watch.set_role_prefs(conn, lcu_watch.AUTOPILOT))
     assert conn.puts() == [{"firstPreference": "JUNGLE", "secondPreference": "UNSELECTED"}]
 
@@ -305,6 +332,14 @@ def test_ready_check_ignores_already_accepted(run):
     assert conn.posts() == []
 
 
+def test_ready_check_respects_runtime_auto_accept_toggle(run, monkeypatch):
+    # The toggle must take effect through the shim at call time (read live).
+    monkeypatch.setattr(lcu_watch, "AUTO_ACCEPT", False)
+    conn = FakeConnection()
+    run(lcu_watch.maybe_accept_ready_check(conn, {"state": "InProgress", "playerResponse": "None"}))
+    assert conn.posts() == []  # AUTO_ACCEPT off -> no accept
+
+
 # --------------------------------------------------------------------------- #
 # set_runes: rune-page management (mutates the client)  [TO_FIX #1]
 # --------------------------------------------------------------------------- #
@@ -317,76 +352,54 @@ PAGE_BODY = {
 }
 
 
-def _perks_handler(pages, owned=5, post_status=200, new_id=100):
-    """Stateful /lol-perks handler: GET pages/inventory, DELETE, POST, PUT."""
-    state = {"pages": [dict(p) for p in pages]}
+def _perks_handler(pages, put_status=200):
+    """/lol-perks handler for the edit-in-place flow: GET pages, PUT pages/{id}."""
 
     def handler(method, endpoint, body):
         if endpoint == "/lol-perks/v1/pages" and method == "get":
-            return FakeResponse(200, [dict(p) for p in state["pages"]])
-        if endpoint == "/lol-perks/v1/inventory":
-            return FakeResponse(200, {"ownedPageCount": owned})
-        if endpoint.startswith("/lol-perks/v1/pages/") and method == "delete":
-            pid = int(endpoint.rsplit("/", 1)[1])
-            state["pages"] = [p for p in state["pages"] if p["id"] != pid]
-            return FakeResponse(204)
-        if endpoint == "/lol-perks/v1/pages" and method == "post":
-            if post_status >= 300:
-                return FakeResponse(post_status)
-            state["pages"].append({"id": new_id, **(body or {})})
-            return FakeResponse(post_status, {"id": new_id})
-        if endpoint == "/lol-perks/v1/currentpage" and method == "put":
-            return FakeResponse(204)
+            return FakeResponse(200, [dict(p) for p in pages])
+        if endpoint.startswith("/lol-perks/v1/pages/") and method == "put":
+            return FakeResponse(put_status)
         return None
 
     return handler
 
 
-def _deletes(conn):
-    return [e for (m, e, b) in conn.calls if m == "delete"]
+def _puts(conn):
+    return [(e, b) for (m, e, b) in conn.calls if m == "put"]
 
 
-def test_set_runes_deletes_prior_auto_pages(run):
+def test_set_runes_edits_the_active_page(run):
     conn = FakeConnection(_perks_handler(
-        [{"id": 1, "name": "My Page", "isDeletable": True, "current": True},
-         {"id": 2, "name": "AUTO - Old", "isDeletable": True, "current": False}],
-        owned=5))
+        [{"id": 1, "name": "My Page", "isEditable": True, "current": False},
+         {"id": 2, "name": "Scratch", "isEditable": True, "current": True}]))
     run(lcu_watch.set_runes(conn, PAGE_BODY))
-    assert _deletes(conn) == ["/lol-perks/v1/pages/2"]  # only our prior page
-    assert "/lol-perks/v1/pages" in conn.posts()
+    # The build is PUT onto the currently-selected page; no create, no slot juggling.
+    assert _puts(conn) == [("/lol-perks/v1/pages/2", PAGE_BODY)]
+    assert conn.posts() == []
 
 
-def test_set_runes_frees_slot_at_limit_prefers_current(run):
+def test_set_runes_warns_when_no_active_page(run, capsys):
     conn = FakeConnection(_perks_handler(
-        [{"id": 1, "name": "A", "isDeletable": True, "current": False},
-         {"id": 2, "name": "B", "isDeletable": True, "current": True}],
-        owned=2))
+        [{"id": 1, "name": "My Page", "isEditable": True, "current": False}]))
     run(lcu_watch.set_runes(conn, PAGE_BODY))
-    assert _deletes(conn) == ["/lol-perks/v1/pages/2"]  # the current page
+    assert _puts(conn) == []  # nothing edited
+    assert "no active rune page" in capsys.readouterr().out.lower()
 
 
-def test_set_runes_never_deletes_undeletable(run):
+def test_set_runes_skips_uneditable_active_page(run, capsys):
     conn = FakeConnection(_perks_handler(
-        [{"id": 1, "name": "Locked", "isDeletable": False, "current": True}],
-        owned=1))
+        [{"id": 9, "name": "Recommended", "isEditable": False, "current": True}]))
     run(lcu_watch.set_runes(conn, PAGE_BODY))
-    assert _deletes(conn) == []
-    assert "/lol-perks/v1/pages" in conn.posts()
+    assert _puts(conn) == []  # never edit a page the client locks
+    assert "can't be edited" in capsys.readouterr().out.lower()
 
 
-def test_set_runes_posts_then_sets_current(run):
-    conn = FakeConnection(_perks_handler([], owned=5, new_id=77))
+def test_set_runes_warns_on_failed_put(run, capsys):
+    conn = FakeConnection(_perks_handler(
+        [{"id": 2, "name": "Scratch", "isEditable": True, "current": True}],
+        put_status=400))
     run(lcu_watch.set_runes(conn, PAGE_BODY))
-    posts = [(e, b) for (m, e, b) in conn.calls if m == "post"]
-    puts = [(e, b) for (m, e, b) in conn.calls if m == "put"]
-    assert posts == [("/lol-perks/v1/pages", PAGE_BODY)]
-    assert puts == [("/lol-perks/v1/currentpage", 77)]
-
-
-def test_set_runes_warns_on_failed_post(run, capsys):
-    conn = FakeConnection(_perks_handler([], owned=5, post_status=400))
-    run(lcu_watch.set_runes(conn, PAGE_BODY))
-    assert [b for (m, e, b) in conn.calls if m == "put"] == []  # no currentpage PUT
     assert "failed" in capsys.readouterr().out.lower()
 
 
@@ -448,6 +461,8 @@ def test_setup_queue_creates_lobby_and_searches(run):
     ap = lcu_watch.Autopilot(mode="solo", lanes={}, lane_order=[], bans=[], start=True)
 
     def handler(method, endpoint, body):
+        if "game-queues" in endpoint:
+            return FakeResponse(200, [{"id": lcu_watch.QUEUE_SOLO, "queueAvailability": "Available"}])
         if endpoint == "/lol-lobby/v2/lobby" and method == "post":
             return FakeResponse(200)
         return None
@@ -458,10 +473,11 @@ def test_setup_queue_creates_lobby_and_searches(run):
     assert "/lol-lobby/v2/lobby/matchmaking/search" in conn.posts()
 
 
-def test_setup_queue_gives_up_when_all_candidates_rejected(run):
+def test_setup_queue_raises_when_all_candidates_rejected(run):
     ap = lcu_watch.Autopilot(mode="solo", lanes={}, lane_order=[], bans=[], start=True)
     conn = FakeConnection(lambda m, e, b: FakeResponse(400) if m == "post" else None)
-    run(lcu_watch.setup_queue(conn, ap))
+    with pytest.raises(lcu_watch.QueueNotAvailableError):
+        run(lcu_watch.setup_queue(conn, ap))
     assert "/lol-lobby/v2/lobby/matchmaking/search" not in conn.posts()
 
 
@@ -533,8 +549,8 @@ def test_summarize_dedupes_and_detects_change():
 # --------------------------------------------------------------------------- #
 def _members_handler(n):
     def handler(method, endpoint, body):
-        if endpoint == "/lol-lobby/v2/lobby" and method == "get":
-            return FakeResponse(200, {"members": [{}] * n})
+        if endpoint == "/lol-lobby/v2/lobby/members" and method == "get":
+            return FakeResponse(200, [{}] * n)
         return None
 
     return handler
@@ -561,8 +577,8 @@ def test_set_role_prefs_warns_on_failure(run, capsys):
     )
 
     def handler(method, endpoint, body):
-        if endpoint == "/lol-lobby/v2/lobby" and method == "get":
-            return FakeResponse(200, {"members": [{}] * 2})
+        if endpoint == "/lol-lobby/v2/lobby/members" and method == "get":
+            return FakeResponse(200, [{}] * 2)
         if "position-preferences" in endpoint and method == "put":
             return FakeResponse(400)
         return None
@@ -572,39 +588,74 @@ def test_set_role_prefs_warns_on_failure(run, capsys):
 
 
 # --------------------------------------------------------------------------- #
-# resolve_member_name fallback chain  [TO_FIX #9]
+# member_names: batch puuid -> name resolution  [TO_FIX #9]
 # --------------------------------------------------------------------------- #
-def test_resolve_member_name_direct(run):
+def _names_handler(by_puuid):
+    """POST /lol-summoner/v2/summoners/puuid -> a summoner DTO per known puuid."""
+
+    def handler(method, endpoint, body):
+        if endpoint == "/lol-summoner/v2/summoners/puuid" and method == "post":
+            return FakeResponse(200, [
+                {"puuid": p, "gameName": by_puuid[p]} for p in body if p in by_puuid
+            ])
+        return None
+
+    return handler
+
+
+def test_member_names_resolves_in_one_request(run):
+    conn = FakeConnection(_names_handler({"a": "Reze", "b": "Snt29"}))
+    assert run(lcu_watch.member_names(conn, ["a", "b"])) == {"a": "Reze", "b": "Snt29"}
+    posts = [(e, b) for (m, e, b) in conn.calls if m == "post"]
+    assert posts == [("/lol-summoner/v2/summoners/puuid", ["a", "b"])]  # one batch call
+
+
+def test_member_names_no_request_when_empty(run):
     conn = FakeConnection()
-    assert run(lcu_watch.resolve_member_name(conn, {"gameName": "Reze"})) == "Reze"
-    assert conn.calls == []  # no lookup when the name is already present
+    assert run(lcu_watch.member_names(conn, [None, ""])) == {}
+    assert conn.calls == []  # nothing to resolve -> no request
 
 
-def test_resolve_member_name_by_puuid(run):
+def test_member_names_degrades_on_error(run):
+    conn = FakeConnection(lambda m, e, b: FakeResponse(500))
+    assert run(lcu_watch.member_names(conn, ["a"])) == {}
+
+
+def test_member_names_drops_nameless_dtos(run):
+    # A DTO with no gameName must be omitted, never mapped to None (dict[str, str]).
     def handler(method, endpoint, body):
-        if endpoint == "/lol-summoner/v2/summoners/puuid/abc":
-            return FakeResponse(200, {"gameName": "Reze"})
+        if endpoint == "/lol-summoner/v2/summoners/puuid" and method == "post":
+            return FakeResponse(200, [
+                {"puuid": "a", "gameName": "Reze"},
+                {"puuid": "b", "gameName": ""},   # unresolved -> dropped
+                {"puuid": "c"},                   # missing entirely -> dropped
+            ])
         return None
 
-    assert run(lcu_watch.resolve_member_name(FakeConnection(handler), {"puuid": "abc"})) == "Reze"
+    assert run(lcu_watch.member_names(FakeConnection(handler), ["a", "b", "c"])) == {"a": "Reze"}
 
 
-def test_resolve_member_name_by_summoner_id(run):
+def test_print_lobby_marks_you_and_batches_names(run, capsys):
     def handler(method, endpoint, body):
-        if endpoint == "/lol-summoner/v1/summoners/55":
-            return FakeResponse(200, {"displayName": "Snt29"})
-        return None
+        if endpoint == "/lol-lobby/v2/lobby" and method == "get":
+            return FakeResponse(200, {
+                "gameConfig": {"queueId": 440, "gameMode": "CLASSIC"},
+                "localMember": {"puuid": "a"},
+                "members": [{"puuid": "a"}, {"puuid": "b"}],
+            })
+        return _names_handler({"a": "Reze", "b": "Snt29"})(method, endpoint, body)
 
-    assert run(lcu_watch.resolve_member_name(FakeConnection(handler), {"summonerId": 55})) == "Snt29"
-
-
-def test_resolve_member_name_unknown(run):
-    conn = FakeConnection(lambda m, e, b: FakeResponse(404))
-    assert run(lcu_watch.resolve_member_name(conn, {"puuid": "x", "summonerId": 1})) == "?"
+    conn = FakeConnection(handler)
+    assert run(lcu_watch.print_lobby(conn)) is True
+    out = capsys.readouterr().out
+    assert "Reze <-- You" in out and "Snt29" in out
+    # the summoner endpoint is hit once for the whole party, not once per member
+    lookups = [e for (m, e, b) in conn.calls if e == "/lol-summoner/v2/summoners/puuid"]
+    assert len(lookups) == 1
 
 
 # --------------------------------------------------------------------------- #
-# current_game_mode / lobby_member_count parsing  [TO_FIX #10]
+# current_game_mode / get_lobby_members parsing  [TO_FIX #10]
 # --------------------------------------------------------------------------- #
 def _session_handler(data, status=200):
     return lambda m, e, b: (
@@ -627,19 +678,20 @@ def test_current_game_mode_non_200(run):
     assert run(lcu_watch.current_game_mode(conn)) == ""
 
 
-def test_lobby_member_count(run):
+def test_get_lobby_members_returns_list(run):
     conn = FakeConnection(_members_handler(3))
-    assert run(lcu_watch.lobby_member_count(conn)) == 3
+    assert len(run(lcu_watch.get_lobby_members(conn))) == 3
 
 
-def test_lobby_member_count_empty_is_one(run):
+def test_get_lobby_members_empty_lobby_is_empty(run):
     conn = FakeConnection(_members_handler(0))
-    assert run(lcu_watch.lobby_member_count(conn)) == 1
+    assert run(lcu_watch.get_lobby_members(conn)) == []
 
 
-def test_lobby_member_count_non_200(run):
+def test_get_lobby_members_non_200_is_empty(run):
+    # Honest "no members reported" rather than a fabricated count of 1.
     conn = FakeConnection(lambda m, e, b: FakeResponse(404))
-    assert run(lcu_watch.lobby_member_count(conn)) == 1
+    assert run(lcu_watch.get_lobby_members(conn)) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -755,3 +807,66 @@ def test_apply_build_warns_on_fetch_error(run, monkeypatch, capsys):
     monkeypatch.setattr(lcu_watch.opgg_runes, "best_build", boom)
     run(lcu_watch.apply_build(FakeConnection(), 103, "middle"))
     assert "could not fetch build" in capsys.readouterr().out.lower()
+
+
+# --------------------------------------------------------------------------- #
+# Shim forwarding contract + runtime AUTO_APPLY toggle  [REVIEW H2 / M3]
+# --------------------------------------------------------------------------- #
+def test_shim_resolves_reads_and_writes_to_one_owner(monkeypatch):
+    # Writing `lcu_watch.X` must land on the module that owns X, and reading it
+    # back must resolve to that same module -- no shim-local divergence.
+    from src import constants, state
+
+    monkeypatch.setattr(lcu_watch, "AUTO_APPLY", False)
+    assert constants.AUTO_APPLY is False        # write reached the owner
+    assert lcu_watch.AUTO_APPLY is False         # read resolves to the same owner
+
+    sentinel = object()
+    monkeypatch.setattr(lcu_watch, "AUTOPILOT", sentinel)
+    assert state.AUTOPILOT is sentinel
+    assert lcu_watch.AUTOPILOT is sentinel
+
+
+class _Event:
+    """Minimal stand-in for an lcu-driver websocket event (just `.data`)."""
+
+    def __init__(self, data):
+        self.data = data
+
+
+def _locked_session(champ_id=42, cell=1, position="middle"):
+    return {
+        "localPlayerCellId": cell,
+        "actions": [[{"actorCellId": cell, "type": "pick",
+                      "championId": champ_id, "completed": True}]],
+        "myTeam": [{"cellId": cell, "assignedPosition": position}],
+        "theirTeam": [],
+    }
+
+
+def test_on_champ_select_applies_build_when_auto_apply_on(run, monkeypatch):
+    from src import handlers
+
+    applied = []
+
+    async def fake_apply(conn, champ_id, position):
+        applied.append((champ_id, position))
+
+    monkeypatch.setattr(handlers, "apply_build", fake_apply)  # the binding the handler calls
+    monkeypatch.setattr(lcu_watch, "AUTO_APPLY", True)
+    run(lcu_watch.on_champ_select(FakeConnection(), _Event(_locked_session(42, position="middle"))))
+    assert applied == [(42, "middle")]
+
+
+def test_on_champ_select_skips_build_when_auto_apply_off(run, monkeypatch):
+    from src import handlers
+
+    applied = []
+
+    async def fake_apply(conn, champ_id, position):
+        applied.append((champ_id, position))
+
+    monkeypatch.setattr(handlers, "apply_build", fake_apply)
+    monkeypatch.setattr(lcu_watch, "AUTO_APPLY", False)  # toggled live through the shim
+    run(lcu_watch.on_champ_select(FakeConnection(), _Event(_locked_session())))
+    assert applied == []
