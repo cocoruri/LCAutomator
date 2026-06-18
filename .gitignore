@@ -1,3 +1,12 @@
+# Python bytecode
 __pycache__
+*.py[cod]
+
+# pytest
+.pytest_cache
+
+# Claude Code workspace
 .claude
+
+# Generated reference-data cache (champions/perks/meta JSON from opgg_runes)
 .cache

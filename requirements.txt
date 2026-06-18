@@ -1,0 +1,5 @@
+# Runtime dependencies.
+#
+# opgg_runes.py is standard-library only (urllib, json, argparse, ...).
+# lcu_watch.py needs lcu-driver to talk to the League client.
+lcu-driver==3.0.2
