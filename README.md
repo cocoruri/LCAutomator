@@ -1,13 +1,36 @@
-# League helper scripts
+# League Champ Select Automator
 
-Two small scripts for League of Legends, built on Riot's local **LCU API** and
-OP.GG's public build data. No API key required.
+Automates the tedious parts of League of Legends champ select through Riot's local
+**LCU API** (and OP.GG's public build data) — accept the ready check, ban/pick in
+ranked, and apply OP.GG runes + summoner spells the moment you lock in. No Riot API
+key required.
 
-- **`opgg_runes.py`** — fetch OP.GG's recommended runes (and summoner spells)
-  for a champion. Standard-library only.
-- **`lcu_watch.py`** — watch the League client and optionally automate it:
-  auto-accept the ready check, auto-ban/pick in ranked, set runes + summoner
-  spells on lock-in, and (optionally) start matchmaking. Needs `lcu-driver`.
+**Where this is going.** Today it's a command-line tool. The goal is a desktop
+**GUI app for automating champ select**: pick your queue, lanes, champs, and bans in
+a UI and let it drive the client. The automation logic already lives in a reusable
+`src/` library (queue setup, draft rules, rune/spell application, lobby/queue reads)
+so the planned GUI can sit directly on top of it, and the whole thing ships as a
+standalone Windows executable built with **PyInstaller** — no Python install needed
+by the end user.
+
+The two pieces today:
+
+- **`opgg_runes.py`** — fetches OP.GG's recommended runes and summoner spells for a
+  champion. Standard-library only.
+- **`lcu_watch.py`** — the CLI front end plus the `src/` automation library. Watches
+  the client over `lcu-driver` and, by default, auto-accepts the ready check and
+  applies runes/spells on lock-in; with `--mode` it also queues and auto-drafts.
+
+## Design principles
+
+- **Decide or fail — never guess.** Every action against the client is either done
+  deterministically or surfaces a clear error (a catchable exception, or a `(warn)`
+  line and a clean skip). It will not invent a value or "do something close" to what
+  you asked — it stops and tells you instead.
+- **Library first.** Behavior lives in small, GUI-reusable modules under `src/`; the
+  CLI is just one front end.
+
+See [`CLAUDE.md`](CLAUDE.md) for architecture and contributor conventions.
 
 ## Setup
 
@@ -50,17 +73,26 @@ python lcu_watch.py --mode flex --lane jungle Shaco Briar --no-start
   banned.
 - `--no-start` — configure roles only; don't create a lobby or start the queue.
 
-### Toggles (constants near the top of `lcu_watch.py`)
+### Runes on lock-in
+
+When `AUTO_APPLY` is on, the OP.GG build is written onto your **currently-active
+rune page, edited in place** (renamed to `AUTO - <champ> <lane>`). No page is
+created or deleted; if there's no editable active page, your runes are left
+untouched and you get a warning. Runes are applied for Summoner's Rift
+(ranked/normals) and ARAM; modes with no OP.GG runes build (ARAM Mayhem, Arena,
+URF, ...) are left alone.
+
+### Toggles (`src/constants.py`)
 
 | Constant      | Default     | Effect |
 |---------------|-------------|--------|
 | `AUTO_ACCEPT` | `True`      | Accept the ready check when a match is found. |
-| `AUTO_APPLY`  | `True`      | Set OP.GG runes + spells when you lock in. |
+| `AUTO_APPLY`  | `True`      | Apply OP.GG runes + spells when you lock in. |
 | `REGION`      | `"global"`  | OP.GG region for build lookups. |
-| `PAGE_PREFIX` | `"AUTO - "` | Name prefix for rune pages this tool creates. |
+| `PAGE_PREFIX` | `"AUTO - "` | Name prefix applied to your active rune page. |
 
-Runes are applied for Summoner's Rift (ranked/normals) and ARAM; modes with no
-OP.GG runes build (ARAM Mayhem, Arena, URF, ...) are left untouched.
+These are read live, so they can also be toggled at runtime via the shim
+(e.g. `lcu_watch.AUTO_APPLY = False`) — useful for an embedding GUI.
 
 ## Tests
 
@@ -68,11 +100,21 @@ OP.GG runes build (ARAM Mayhem, Arena, URF, ...) are left untouched.
 python -m pytest
 ```
 
-Covers the pure build-mapping and draft/queue logic without a live client
-(network and the LCU connection are stubbed).
+Covers the build-mapping, draft/queue, and event-handler logic without a live
+client (network and the LCU connection are stubbed).
+
+## Packaging
+
+Built into a standalone executable with PyInstaller:
+
+```bash
+pyinstaller lcu_watch.spec        # -> dist/lcu_watch/
+```
+
+`src/` is a real package so PyInstaller bundles it from `lcu_watch.py`'s imports.
 
 ## Notes
 
-The LCU API is local and undocumented; Riot tolerates client tooling like this
-but it isn't officially supported, and endpoints/queue ids can change between
+The LCU API is local and only semi-documented; Riot tolerates client tooling like
+this but it isn't officially supported, and endpoints/queue ids can change between
 patches.
