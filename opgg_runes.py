@@ -356,7 +356,12 @@ class RunePage:
         return self.primary_rune_ids + self.secondary_rune_ids + self.stat_mod_ids
 
     def to_lcu_page(self, name: str) -> dict:
-        """Body for POST /lol-perks/v1/pages on the League client."""
+        """A rune-page body for the League client (lol-perks).
+
+        lcu_watch PUTs this onto your currently-active page, editing it in place,
+        so `name` renames that page (the `"current"` flag is then redundant but
+        harmless). Still shaped to also work as a POST body to create a page.
+        """
         return {
             "name": name,
             "primaryStyleId": self.primary_style,
