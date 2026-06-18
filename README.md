@@ -96,6 +96,28 @@ URF, ...) are left alone.
 These are read live, so they can also be toggled at runtime via the shim
 (e.g. `lcu_watch.AUTO_APPLY = False`) — useful for an embedding GUI.
 
+## GUI (PySide6)
+
+A desktop front end over the same `src/` library: a logged-in user box, the live
+gameflow phase, a champ-select view (your team + revealed enemy + bans), champion
+search with Pick/Ban, and an "auto-start party vs. watch-only" toggle.
+
+The GUI deps are kept out of the core requirements so CLI users aren't forced to
+install Qt:
+
+```bash
+pip install -r requirements.txt        # core
+pip install -r requirements-gui.txt    # + PySide6 (and qasync)
+python -m gui                           # or: python gui_app.py
+```
+
+Architecture: lcu-driver runs on its own asyncio loop in a background thread (it
+owns and closes its loop, so it can't share Qt's). Its event handlers emit
+framework-agnostic updates to an event sink (`src/events.py`); the GUI's sink is a
+`QObject` that re-emits them as Qt signals onto the main thread. The CLI keeps
+printing to the console exactly as before. The Qt-free parts (`gui/viewmodel.py`,
+the `src/` transforms) are unit-tested headlessly.
+
 ## Tests
 
 ```bash

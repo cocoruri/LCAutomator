@@ -5,3 +5,9 @@
 ---
 2.
 - [ ] Make GUI to hook into `lcu_watch.py`
+  - [ ] Search function to look for Champions by name
+    - [ ] This must work for pick and ban
+  - [ ] Checkbox toggle between auto start party or just watch and pick/ban
+  - [ ] Small box with data about the logged user on the top side
+  - [ ] When in Champ select show what everyone is picking and banning
+  - [ ] Always show the phase
