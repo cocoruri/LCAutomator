@@ -1,113 +1,35 @@
-# TO_FIX — Suggested additional tests
+# TO_FIX
 
-The `tests/` suite currently passes (65 tests) and covers the pure helpers well
-(`_slug`, `_lookup`, `arrange_spells`, `unavailable_champions`, the `run_draft`
-decision matrix, `RunePage` mapping, plus happy-path queue setup and
-ready-check).
+## Bugs / Correctness
 
-The gaps below are concentrated in three areas that carry the most risk: **code
-that mutates the live client**, **the build / lane-selection fallback logic**,
-and **error / retry paths**. Ordered by value. All fit the existing harness —
-`FakeConnection(handler)` + the `run` fixture for async, and `monkeypatch` of
-`get_json` / `best_build` for network.
+- [x] **#1** `opgg_runes.py` `_lookup` (line ~181): prefix match is non-deterministic — dict iteration order decides which champion wins on ambiguous input (e.g. `"ka"` → Kalista vs Karma vs Karthus). Sort matches (e.g. by slug length then alpha) or reject ambiguous prefixes.
+- [x] **#2** `lcu_watch.py` slot-freeing loop (line ~332): frees until `len(pages) < owned`, then immediately POSTs one more — can exceed the limit by one. Also no user-facing message when all pages are non-deletable and the POST will fail.
+- [x] **#3** `lcu_watch.py` broad `except Exception` around `import opgg_runes` (line ~84) and cosmetic-name loaders (lines ~229, ~239): silently degrades to `opgg_runes = None` even on programming errors (SyntaxError, AttributeError). At minimum log the caught exception.
+- [x] **#4** `lcu_watch.py` `arrange_spells` (line ~353): when both spells are D-forced (e.g. Flash + Ghost), both map to slot 0 with no warning. Document or guard the impossible pair.
 
----
+## Hardcoded Strings
 
-## P1 — Untested logic that changes the client or encodes core rules
+- [x] **#5** `opgg_runes.py` line ~130: Data Dragon host `https://ddragon.leagueoflegends.com` and locale `en_US` are inline magic strings. Extract `DDRAGON_BASE` and `LOCALE` constants (locale matters for non-English users).
+- [x] **#6** `opgg_runes.py`: default values `"global"` and `"ranked"` are repeated literally across 6+ function signatures and argparse defaults. Extract `DEFAULT_REGION` and `DEFAULT_MODE` constants so CLI and function defaults stay in sync.
+- [x] **#7** `lcu_watch.py`: LCU endpoint paths are inline strings repeated N times (`/lol-perks/v1/pages` ×4, `/lol-lobby/v2/lobby` ×5, etc.). Collect into module-level constants or an `Endpoints` class; same strings appear independently in the test file.
+- [x] **#8** `lcu_watch.py`: game-protocol magic strings scattered throughout — `"GAME_STARTING"`, `"PLANNING"`, `"InProgress"`, `"None"`, `"ARAM"`, `"CLASSIC"`, `"BAN_PICK"`, `"mayhem"`, `"Available"`. Replace with named constants or an enum.
+- [x] **#9** `lcu_watch.py` line ~498: role-preference sentinels `"UNSELECTED"` and `"FILL"` are inline magic strings. Extract constants.
 
-### 1. `set_runes` page management — `lcu_watch.py:281`
-Entirely untested, and it *deletes and creates* rune pages. Drive with a
-`FakeConnection` handler:
-- deletes pre-existing `AUTO -` pages before creating the new one
-- when at the `ownedPageCount` limit, deletes an editable page (prefers the
-  `current` one) to make room
-- never deletes a page with `isDeletable` false
-- POSTs the page body, then PUTs `currentpage` to the created id
-- warns (does not raise) on a non-2xx POST
+## Hardcoded Numbers
 
-### 2. `best_build` ranked lane selection + fallback — `opgg_runes.py:360`
-Only the ARAM positionless path is tested. Untested:
-- `preferred` lane is tried first
-- falls back to `champion_positions` order when `preferred` misses
-- dedupes already-`tried` lanes, then probes all `POSITIONS` keeping the
-  most-played build
-- raises `RuntimeError` when no position yields a build
-- positionless `RuntimeError` when fetch returns `None` (`opgg_runes.py:387`)
+- [x] **#10** `opgg_runes.py` line ~347: HTTP status codes `404` and `422` are bare integers. Reference `http.HTTPStatus` or define named constants.
+- [x] **#11** `lcu_watch.py` line ~498: `5` as the full-team-size threshold is a magic number. Extract `FULL_TEAM_SIZE = 5`.
+- [x] **#12** Tests: queue IDs `420`, `440`, `2400`, `450` are duplicated between the source `QUEUES` dict and test files. Tests should reference the source constants.
 
-### 3. `attempt_action` retry / give-up — `lcu_watch.py` (~613)
-Resilience logic backed by `STATE.action_attempts`. Drive across repeated calls
-with a failing-then-succeeding handler:
-- success adds the id to `STATE.handled_actions`
-- first failure warns and retries (id *not* marked handled)
-- gives up after `MAX_ACTION_ATTEMPTS`, marking handled
+## Structure / Maintainability
 
-### 4. `fetch_build` HTTP error branching — `opgg_runes.py:334`
-- 404 / 422 → `None`
-- any other `HTTPError` re-raises
-- empty `summoner_spells` → `best_spells == []`
-- positionless `label` is the mode, not the position
+- [x] **#13** `opgg_runes.py` lines ~144–228: `champion_index`, `perk_names`, and `champion_meta` share the same memory→cache→network pattern in near-identical code. Consolidate into a single parameterized cache helper.
+- [x] **#14** `lcu_watch.py` `ChampSelectState.reset` (line ~185): calls `self.__init__()` to reset state — breaks under subclassing, confuses type checkers. Reassign fields explicitly or replace `STATE` with a fresh instance.
+- [x] **#15** `lcu_watch.py`: module-level mutable globals `STATE`, `AUTOPILOT`, `_champ_names`, `_spell_names` are mutated from async handlers. Makes isolated testing hard (conftest must reset them) and would break under concurrent connections.
+- [x] **#16** `opgg_runes.py` line ~135: `int(champ["key"])` and `p["stats"]["play"]` in fetch helpers have no defensive handling. A schema change at the data source produces an unhandled `KeyError`/`ValueError` that discards the whole index silently.
+- [x] **#17** `opgg_runes.py` `get_json` (lines ~74–77): only `fetch_build` catches `HTTPError`; `URLError` (offline/DNS) and `json.JSONDecodeError` propagate raw from all callers.
 
----
+## Project / Repo
 
-## P2 — Medium priority
-
-### 5. `setup_queue` orchestration — `lcu_watch.py:479`
-- `--no-start` sets roles only and never POSTs a lobby
-- otherwise tries candidates until one is accepted
-- all candidates rejected → gives up without starting the search
-- success POSTs the matchmaking search
-
-### 6. CLI validation paths (raise `SystemExit` — easy wins)
-- `build_autopilot`: unknown lane (`lcu_watch.py:833`) and lane given twice
-  (`lcu_watch.py:835`)
-- `main` / `parse_args`: more than two `--lane` (`lcu_watch.py:901`)
-
-### 7. Quick pure-helper wins
-- `champ_name` / `spell_name`: `None` / `<=0` sentinels, known id, unknown id →
-  `Champion#N` / `Spell#N` / `-`
-- `summarize`: identical session → equal tuple; a changed pick / intent →
-  different tuple (this drives the print-dedupe)
-
-### 8. `set_role_prefs` remaining branches — `lcu_watch.py:500`
-- the `"FILL"` fallback (small party, single configured lane)
-- the ARAM / no-lane-order early return
-- the warn-on-failure path
-(Full-stack and two-pref small party are already covered.)
-
-### 9. `resolve_member_name` fallback chain — `lcu_watch.py`
-Direct `gameName`; puuid lookup; `summonerId` fallback; `"?"` when all fail.
-
-### 10. `current_game_mode` / `lobby_member_count` parsing
-- queue vs map `gameMode` fallback; non-200 → `""`
-- `members` length vs the `or 1` fallback on empty / missing members
-
-### 11. Reference-data caching — `opgg_runes.py`
-- `_load_cache` / `_save_cache` round-trip and OSError tolerance
-- `champion_index` / `perk_names` memory → cache → network ordering
-- `perk_name` refresh-once-on-miss
-- JSON string → int key restoration for perks
-
----
-
-## P3 — Lower priority
-
-### 12. `set_spells`
-`<2` spells is a no-op; correct PATCH body; warn on failure.
-
-### 13. `opgg_runes.main()` CLI
-Exit codes (unknown champion → 1 on stderr; "no rune data" → 1); `--json` /
-`--all` output shape; auto-detect vs explicit `--position`.
-
-### 14. `ChampSelectState.reset()` / `on_champ_select_end`
-Clears `handled_actions` and `action_attempts` (regression guard for the
-consolidated state object).
-
-### 15. `apply_build` orchestration
-Unsupported mode leaves setup alone; ranked passes the mapped `preferred` lane;
-a fetch exception is caught and warned (monkeypatch `opgg_runes.best_build` +
-`FakeConnection`).
-
----
-
-**Highest risk-reduction per test:** #1 (`set_runes`) and #3 (`attempt_action`)
-— both mutate state / the client and currently have zero coverage.
+- [x] **#18** `.cache/` JSON files (`champions.json`, `perks.json`, `meta.json`) are committed to the repo. These are regenerated runtime artifacts; `meta.json` goes stale daily. Add `.cache/` to `.gitignore`.
+- [x] **#19** This file (`TO_FIX.md`) was empty — `[TO_FIX #N]` tags in the test files referenced a checklist that no longer existed.

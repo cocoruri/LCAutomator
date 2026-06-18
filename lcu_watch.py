@@ -81,7 +81,8 @@ class SummonerSpell(IntEnum):
 # Reuse the runes script: champion names + OP.GG build (runes & spells) fetch.
 try:
     import opgg_runes
-except Exception:  # pragma: no cover - the watcher still works without it
+except ImportError as exc:  # pragma: no cover - the watcher still works without it
+    print(f"(warn) opgg_runes unavailable; runes/spells auto-apply disabled: {exc!r}")
     opgg_runes = None
 
 connector = Connector()
@@ -96,6 +97,31 @@ PAGE_PREFIX = "AUTO - "  # rune pages we create are named with this prefix
 # gameMode string is mapped onto one of these (see opgg_mode_for); anything
 # else (Arena, URF, etc.) is left untouched.
 SUPPORTED_MODES = {"ranked", "aram"}
+
+
+# --- game-protocol strings the client sends --------------------------------- #
+# champ-select action types
+ACTION_PICK = "pick"
+ACTION_BAN = "ban"
+
+# gameMode values
+GAME_MODE_ARAM = "ARAM"
+GAME_MODE_CLASSIC = "CLASSIC"  # Summoner's Rift (ranked solo/flex, normals)
+
+# gameflow phases
+PHASE_LOBBY = "Lobby"
+
+# champ-select timer phases where bans/picks can't yet be completed
+PHASE_GAME_STARTING = "GAME_STARTING"
+PHASE_PLANNING = "PLANNING"
+
+# ready-check state / our response
+READY_CHECK_IN_PROGRESS = "InProgress"
+READY_CHECK_NO_RESPONSE = "None"  # we haven't accepted/declined yet
+
+# queue discovery (ARAM event lookup)
+ARAM_EVENT_KEYWORD = "mayhem"
+QUEUE_AVAILABLE = "Available"
 
 # The client labels lanes differently than OP.GG; map one to the other.
 LCU_TO_OPGG = {
@@ -117,16 +143,22 @@ class Queue:
     mode: str | None = None  # the --mode that selects it (None = display only)
 
 
-# Single source of truth, keyed by Riot queue id (gameMode in parens):
-#   420 SoloQ / 440 Flex (CLASSIC), 2400 ARAM Mayhem (KIWI), 450 ARAM (ARAM),
-#   1750 Arena (CHERRY -- display only, not startable via --mode).
+# Riot queue ids (gameMode in parens). 2400 ARAM Mayhem reports the rotating
+# codename "KIWI"; 1750 Arena reports "CHERRY".
+QUEUE_SOLO = 420  # CLASSIC
+QUEUE_FLEX = 440  # CLASSIC
+QUEUE_ARAM_MAYHEM = 2400  # KIWI
+QUEUE_ARAM = 450  # ARAM
+QUEUE_ARENA = 1750  # CHERRY -- display only, not startable via --mode
+
+# Single source of truth, keyed by queue id.
 # Order matters for --mode aram: try the Mayhem event first, then plain ARAM.
 QUEUES = {
-    420: Queue("SoloQ", "solo"),
-    440: Queue("Flex", "flex"),
-    2400: Queue("ARAM Mayhem", "aram"),
-    450: Queue("ARAM", "aram"),
-    1750: Queue("Arena"),
+    QUEUE_SOLO: Queue("SoloQ", "solo"),
+    QUEUE_FLEX: Queue("Flex", "flex"),
+    QUEUE_ARAM_MAYHEM: Queue("ARAM Mayhem", "aram"),
+    QUEUE_ARAM: Queue("ARAM", "aram"),
+    QUEUE_ARENA: Queue("Arena"),
 }
 
 
@@ -154,6 +186,12 @@ POSITION_ORDER = {"top": 0, "jungle": 1, "middle": 2, "bottom": 3, "utility": 4}
 UNRANKED_SORT_KEY = len(POSITION_ORDER)  # sorts unknown/unassigned positions last
 
 DEFAULT_OWNED_PAGES = 2  # rune-page slots assumed when the client doesn't report
+
+FULL_TEAM_SIZE = 5  # a full premade fills every role, so no second preference
+
+# Role-preference sentinels the lobby endpoint accepts for the second slot.
+ROLE_UNSELECTED = "UNSELECTED"  # full premade: one fixed role, no backup
+ROLE_FILL = "FILL"  # smaller party with a single chosen lane: fill the rest
 
 
 @dataclass
@@ -183,15 +221,69 @@ class ChampSelectState:
     action_attempts: dict[int, int] = field(default_factory=dict)  # id -> retries
 
     def reset(self) -> None:
-        self.__init__()
+        # Reassign every field __init__ sets, rather than calling __init__ again
+        # (which breaks under subclassing and confuses type checkers).
+        self.last_snapshot = None
+        self.applied_for = None
+        self.handled_actions = set()
+        self.action_attempts = {}
 
 
-_champ_names: dict[int, str] = {}  # championId -> display name (cached on connect)
-_spell_names: dict[int, str] = {}  # summonerSpellId -> display name (cached on connect)
-STATE = ChampSelectState()  # per-session draft/apply bookkeeping
-AUTOPILOT: Autopilot | None = None  # set from CLI args in main()
+# These four are module-level because they are shared across the async LCU event
+# handlers (on_ready, on_champ_select, ...), which are registered as free
+# functions and have no instance to hang state off. A single live client is
+# assumed; concurrent connections would need this state scoped per-connection.
+_champ_names: dict[int, str] = {}  # championId -> display name; cached on connect, read by every handler
+_spell_names: dict[int, str] = {}  # summonerSpellId -> display name; cached on connect, read by every handler
+STATE = ChampSelectState()  # per-session draft/apply bookkeeping, mutated from champ-select handlers
+AUTOPILOT: Autopilot | None = None  # CLI config set once in main(), read by the queue/draft handlers
 
 MAX_ACTION_ATTEMPTS = 8  # give up auto-ban/pick after this many rejected tries
+
+
+class Endpoints:
+    """LCU REST paths, kept in one place so call sites read declaratively."""
+
+    SUMMONER_SPELLS_ASSETS = "/lol-game-data/assets/v1/summoner-spells.json"
+
+    PERKS_PAGES = "/lol-perks/v1/pages"
+    PERKS_INVENTORY = "/lol-perks/v1/inventory"
+    PERKS_CURRENT_PAGE = "/lol-perks/v1/currentpage"
+
+    CHAMP_SELECT_SESSION = "/lol-champ-select/v1/session"
+    CHAMP_SELECT_MY_SELECTION = "/lol-champ-select/v1/session/my-selection"
+
+    GAMEFLOW_SESSION = "/lol-gameflow/v1/session"
+    GAMEFLOW_PHASE = "/lol-gameflow/v1/gameflow-phase"
+
+    GAME_QUEUES = "/lol-game-queues/v1/queues"
+
+    LOBBY = "/lol-lobby/v2/lobby"
+    LOBBY_POSITION_PREFERENCES = (
+        "/lol-lobby/v2/lobby/members/localMember/position-preferences"
+    )
+    LOBBY_SEARCH = "/lol-lobby/v2/lobby/matchmaking/search"
+
+    READY_CHECK = "/lol-matchmaking/v1/ready-check"
+    READY_CHECK_ACCEPT = "/lol-matchmaking/v1/ready-check/accept"
+
+    CURRENT_SUMMONER = "/lol-summoner/v1/current-summoner"
+
+    @staticmethod
+    def perks_page(page_id) -> str:
+        return f"/lol-perks/v1/pages/{page_id}"
+
+    @staticmethod
+    def champ_select_action(action_id) -> str:
+        return f"/lol-champ-select/v1/session/actions/{action_id}"
+
+    @staticmethod
+    def summoner_by_puuid(puuid) -> str:
+        return f"/lol-summoner/v2/summoners/puuid/{puuid}"
+
+    @staticmethod
+    def summoner_by_id(summoner_id) -> str:
+        return f"/lol-summoner/v1/summoners/{summoner_id}"
 
 
 # --------------------------------------------------------------------------- #
@@ -231,9 +323,7 @@ async def load_static(connection) -> None:
     # Summoner-spell names come straight from the client's bundled assets,
     # so this part needs no internet connection.
     try:
-        resp = await connection.request(
-            "get", "/lol-game-data/assets/v1/summoner-spells.json"
-        )
+        resp = await connection.request("get", Endpoints.SUMMONER_SPELLS_ASSETS)
         for spell in await resp.json():
             _spell_names[spell["id"]] = spell["name"]
     except Exception as exc:  # asset fetch/parse -> fall back to "Spell#<id>"
@@ -249,7 +339,7 @@ def local_pick(session: dict) -> tuple[int, bool]:
     champion_id, locked = 0, False
     for group in session.get("actions", []):
         for action in group:
-            if action.get("actorCellId") == cell and action.get("type") == "pick":
+            if action.get("actorCellId") == cell and action.get("type") == ACTION_PICK:
                 champion_id = action.get("championId") or champion_id
                 locked = action.get("completed", False)
     return champion_id, locked
@@ -319,32 +409,39 @@ def ok(status: int) -> bool:
 
 async def set_runes(connection, page_body: dict) -> None:
     """Create the rune page and make it active, freeing a slot if needed."""
-    pages = await (await connection.request("get", "/lol-perks/v1/pages")).json()
+    pages = await (await connection.request("get", Endpoints.PERKS_PAGES)).json()
 
     # Remove any page we created on a previous lock-in so they don't pile up.
     for page in pages:
         if str(page.get("name", "")).startswith(PAGE_PREFIX) and page.get(
             "isDeletable", True
         ):
-            await connection.request("delete", f"/lol-perks/v1/pages/{page['id']}")
+            await connection.request("delete", Endpoints.perks_page(page["id"]))
 
-    # If still at the page limit, delete an editable page to make room.
-    inv = await (await connection.request("get", "/lol-perks/v1/inventory")).json()
+    # Free slots until there's room for the page we're about to POST. The new
+    # page needs one free slot, so the target is len(pages) <= owned - 1.
+    inv = await (await connection.request("get", Endpoints.PERKS_INVENTORY)).json()
     owned = inv.get("ownedPageCount", DEFAULT_OWNED_PAGES)
-    pages = await (await connection.request("get", "/lol-perks/v1/pages")).json()
+    pages = await (await connection.request("get", Endpoints.PERKS_PAGES)).json()
     deletable = [p for p in pages if p.get("isDeletable", True)]
     while deletable and len(pages) >= owned:
         victim = next((p for p in deletable if p.get("current")), deletable[0])
-        await connection.request("delete", f"/lol-perks/v1/pages/{victim['id']}")
+        await connection.request("delete", Endpoints.perks_page(victim["id"]))
         deletable.remove(victim)
         pages.remove(victim)
 
-    resp = await connection.request("post", "/lol-perks/v1/pages", data=page_body)
+    if len(pages) >= owned:
+        print(
+            f"  (warn) no deletable rune-page slot free ({len(pages)}/{owned} used); "
+            "the new page may be rejected."
+        )
+
+    resp = await connection.request("post", Endpoints.PERKS_PAGES, data=page_body)
     if ok(resp.status):
         created = await resp.json()
         # Belt and suspenders: explicitly select it as the current page.
         await connection.request(
-            "put", "/lol-perks/v1/currentpage", data=created.get("id")
+            "put", Endpoints.PERKS_CURRENT_PAGE, data=created.get("id")
         )
     else:
         print(f"  (warn) setting runes failed: HTTP {resp.status}")
@@ -357,6 +454,12 @@ def arrange_spells(spell_ids: list[int]) -> list[int]:
     0 (D-forced) / 1 (no preference) / 2 (F-forced) puts each spell where it
     belongs while leaving unconstrained spells in their original order.
     """
+
+    if sum(1 for s in spell_ids if s in D_SLOT_SPELLS) > 1:
+        # Both want the D slot (e.g. Flash + Ghost): only one can have it. We
+        # leave the pair in its given order rather than guessing a winner.
+        print("  (warn) both spells prefer the D slot; leaving slot order unchanged.")
+        return list(spell_ids)
 
     def key(spell_id: int) -> int:
         if spell_id in D_SLOT_SPELLS:
@@ -374,7 +477,7 @@ async def set_spells(connection, spell_ids: list[int]) -> None:
         return
     body = {"spell1Id": spell_ids[0], "spell2Id": spell_ids[1]}
     resp = await connection.request(
-        "patch", "/lol-champ-select/v1/session/my-selection", data=body
+        "patch", Endpoints.CHAMP_SELECT_MY_SELECTION, data=body
     )
     if not ok(resp.status):
         print(f"  (warn) setting summoner spells failed: HTTP {resp.status}")
@@ -388,16 +491,16 @@ def opgg_mode_for(game_mode: str) -> str | None:
     build, so it (like Arena/URF) returns None and is left untouched.
     """
     gm = (game_mode or "").upper()
-    if gm == "ARAM":
+    if gm == GAME_MODE_ARAM:
         return "aram"
-    if gm == "CLASSIC":
+    if gm == GAME_MODE_CLASSIC:
         return "ranked"
     return None  # KIWI (ARAM Mayhem), CHERRY (Arena), URF, ... -> no runes build
 
 
 async def current_game_mode(connection) -> str:
     """The client's current gameMode string (e.g. CLASSIC, ARAM, KIWI, CHERRY)."""
-    resp = await connection.request("get", "/lol-gameflow/v1/session")
+    resp = await connection.request("get", Endpoints.GAMEFLOW_SESSION)
     if not ok(resp.status):
         return ""
     data = await resp.json()
@@ -465,11 +568,11 @@ async def queue_candidates(connection, mode: str) -> list[int]:
         return list(MODE_QUEUES.get(mode, []))
 
     discovered: list[int] = []
-    resp = await connection.request("get", "/lol-game-queues/v1/queues")
+    resp = await connection.request("get", Endpoints.GAME_QUEUES)
     if ok(resp.status):
         for q in await resp.json():
             text = f"{q.get('name', '')} {q.get('description', '')}".lower()
-            if "mayhem" in text and q.get("queueAvailability") == "Available":
+            if ARAM_EVENT_KEYWORD in text and q.get("queueAvailability") == QUEUE_AVAILABLE:
                 discovered.append(q["id"])
 
     seen: set[int] = set()  # dedupe, preserve order (discovered, then known/fallback)
@@ -478,7 +581,7 @@ async def queue_candidates(connection, mode: str) -> list[int]:
 
 async def lobby_member_count(connection) -> int:
     """How many players are in the current lobby (1 if there's no lobby/info)."""
-    resp = await connection.request("get", "/lol-lobby/v2/lobby")
+    resp = await connection.request("get", Endpoints.LOBBY)
     if ok(resp.status):
         return len((await resp.json()).get("members") or []) or 1
     return 1
@@ -494,18 +597,18 @@ async def set_role_prefs(connection, ap: Autopilot) -> None:
     if ap.is_aram or not ap.lane_order:
         return
     first = ap.lane_order[0]
-    if await lobby_member_count(connection) >= 5:
-        second = "UNSELECTED"  # 5-stack: one role each
+    if await lobby_member_count(connection) >= FULL_TEAM_SIZE:
+        second = ROLE_UNSELECTED  # 5-stack: one role each
     else:
-        second = ap.lane_order[1] if len(ap.lane_order) > 1 else "FILL"
+        second = ap.lane_order[1] if len(ap.lane_order) > 1 else ROLE_FILL
 
     resp = await connection.request(
         "put",
-        "/lol-lobby/v2/lobby/members/localMember/position-preferences",
+        Endpoints.LOBBY_POSITION_PREFERENCES,
         data={"firstPreference": first, "secondPreference": second},
     )
     if ok(resp.status):
-        shown = first if second == "UNSELECTED" else f"{first} / {second}"
+        shown = first if second == ROLE_UNSELECTED else f"{first} / {second}"
         print(f"  Roles: {shown}")
     else:
         print(f"  (warn) could not set roles: HTTP {resp.status}")
@@ -528,7 +631,7 @@ async def setup_queue(connection, ap: Autopilot) -> None:
     created = None
     for queue_id in candidates:
         resp = await connection.request(
-            "post", "/lol-lobby/v2/lobby", data={"queueId": queue_id}
+            "post", Endpoints.LOBBY, data={"queueId": queue_id}
         )
         if ok(resp.status):
             created = queue_id
@@ -541,7 +644,7 @@ async def setup_queue(connection, ap: Autopilot) -> None:
 
     await set_role_prefs(connection, ap)
 
-    resp = await connection.request("post", "/lol-lobby/v2/lobby/matchmaking/search")
+    resp = await connection.request("post", Endpoints.LOBBY_SEARCH)
     if ok(resp.status):
         print("  Searching for a match...")
     else:
@@ -562,7 +665,7 @@ def unavailable_champions(session: dict) -> tuple[set[int], set[int]]:
         for action in group:
             cid = action.get("championId") or 0
             if cid and action.get("completed"):
-                (banned if action.get("type") == "ban" else taken).add(cid)
+                (banned if action.get("type") == ACTION_BAN else taken).add(cid)
     for team in ("myTeam", "theirTeam"):
         for player in session.get(team, []):
             cid = player.get("championId") or 0
@@ -599,7 +702,7 @@ async def complete_action(connection, action_id: int, champion_id: int) -> int:
     """PATCH an action to completed; returns the HTTP status."""
     resp = await connection.request(
         "patch",
-        f"/lol-champ-select/v1/session/actions/{action_id}",
+        Endpoints.champ_select_action(action_id),
         data={"championId": champion_id, "completed": True},
     )
     return resp.status
@@ -635,12 +738,12 @@ async def run_draft(connection, session: dict) -> None:
     # only declare pick intent) the ban action is already flagged in-progress,
     # but the client rejects completing it. Only act once bans/picks are live.
     phase = (session.get("timer") or {}).get("phase")
-    if phase in ("GAME_STARTING", "PLANNING"):
+    if phase in (PHASE_GAME_STARTING, PHASE_PLANNING):
         return
     banned, taken = unavailable_champions(session)
 
     # --- Ban: first choice, unless already banned -> second choice. ---------- #
-    ban = local_action_in_progress(session, "ban")
+    ban = local_action_in_progress(session, ACTION_BAN)
     if ban and ban["id"] not in STATE.handled_actions:
         target = next((b for b in ap.bans if b not in banned), None)
         if target is None:
@@ -651,7 +754,7 @@ async def run_draft(connection, session: dict) -> None:
         return
 
     # --- Pick: first available choice for the assigned lane. ----------------- #
-    pick = local_action_in_progress(session, "pick")
+    pick = local_action_in_progress(session, ACTION_PICK)
     if pick and pick["id"] not in STATE.handled_actions:
         lane = assigned_lane(session)
         choices = ap.lanes.get(lane)
@@ -674,11 +777,11 @@ async def maybe_accept_ready_check(connection, data: dict) -> None:
     """Accept the match if the ready check is live and we haven't responded."""
     if (
         AUTO_ACCEPT
-        and data.get("state") == "InProgress"
-        and data.get("playerResponse") == "None"
+        and data.get("state") == READY_CHECK_IN_PROGRESS
+        and data.get("playerResponse") == READY_CHECK_NO_RESPONSE
     ):
         print("Match found - auto-accepting...")
-        await connection.request("post", "/lol-matchmaking/v1/ready-check/accept")
+        await connection.request("post", Endpoints.READY_CHECK_ACCEPT)
 
 
 def queue_label(queue_id, game_mode: str = "") -> str:
@@ -698,9 +801,9 @@ async def resolve_member_name(connection, member: dict) -> str:
         return direct
     lookups = []
     if member.get("puuid"):
-        lookups.append(f"/lol-summoner/v2/summoners/puuid/{member['puuid']}")
+        lookups.append(Endpoints.summoner_by_puuid(member["puuid"]))
     if member.get("summonerId"):
-        lookups.append(f"/lol-summoner/v1/summoners/{member['summonerId']}")
+        lookups.append(Endpoints.summoner_by_id(member["summonerId"]))
     for url in lookups:
         resp = await connection.request("get", url)
         if ok(resp.status):
@@ -713,7 +816,7 @@ async def resolve_member_name(connection, member: dict) -> str:
 
 async def print_lobby(connection) -> bool:
     """Print 'Lobby (<mode>)' and the party members. False if not in a lobby."""
-    resp = await connection.request("get", "/lol-lobby/v2/lobby")
+    resp = await connection.request("get", Endpoints.LOBBY)
     if not ok(resp.status):
         return False
     lobby = await resp.json()
@@ -735,19 +838,19 @@ async def on_ready(connection):
     print("✓ Connected to the League client.")
     await load_static(connection)
 
-    resp = await connection.request("get", "/lol-summoner/v1/current-summoner")
+    resp = await connection.request("get", Endpoints.CURRENT_SUMMONER)
     if ok(resp.status):
         me = await resp.json()
         who = me.get("gameName") or me.get("displayName") or "?"
         print(f"  Logged in as {who} (level {me.get('summonerLevel')})")
 
-    resp = await connection.request("get", "/lol-gameflow/v1/gameflow-phase")
+    resp = await connection.request("get", Endpoints.GAMEFLOW_PHASE)
     phase = await resp.json() if ok(resp.status) else None
-    if phase != "Lobby" or not await print_lobby(connection):
+    if phase != PHASE_LOBBY or not await print_lobby(connection):
         print(f"  Current phase: {phase}")
 
     # If we connected mid-ready-check, handle it right away.
-    resp = await connection.request("get", "/lol-matchmaking/v1/ready-check")
+    resp = await connection.request("get", Endpoints.READY_CHECK)
     if ok(resp.status):
         await maybe_accept_ready_check(connection, await resp.json())
 
@@ -762,22 +865,18 @@ async def on_close(_):
     print("Client closed - stopping watcher.")
 
 
-@connector.ws.register(
-    "/lol-gameflow/v1/gameflow-phase", event_types=("CREATE", "UPDATE")
-)
+@connector.ws.register(Endpoints.GAMEFLOW_PHASE, event_types=("CREATE", "UPDATE"))
 async def on_phase(connection, event):
     print(f"[phase] -> {event.data}")
 
 
-@connector.ws.register(
-    "/lol-matchmaking/v1/ready-check", event_types=("CREATE", "UPDATE")
-)
+@connector.ws.register(Endpoints.READY_CHECK, event_types=("CREATE", "UPDATE"))
 async def on_ready_check(connection, event):
     """Accept the match when the ready-check popup appears."""
     await maybe_accept_ready_check(connection, event.data or {})
 
 
-@connector.ws.register("/lol-champ-select/v1/session", event_types=("CREATE", "UPDATE"))
+@connector.ws.register(Endpoints.CHAMP_SELECT_SESSION, event_types=("CREATE", "UPDATE"))
 async def on_champ_select(connection, event):
     session = event.data
 
@@ -806,7 +905,7 @@ async def on_champ_select(connection, event):
             await apply_build(connection, champ_id, position)
 
 
-@connector.ws.register("/lol-champ-select/v1/session", event_types=("DELETE",))
+@connector.ws.register(Endpoints.CHAMP_SELECT_SESSION, event_types=("DELETE",))
 async def on_champ_select_end(connection, event):
     STATE.reset()
     print("Champ select ended.\n")

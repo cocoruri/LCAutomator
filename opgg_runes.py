@@ -30,8 +30,9 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from http import HTTPStatus
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 USER_AGENT = "Mozilla/5.0 (opgg-runes script)"
 
@@ -56,7 +57,9 @@ POSITIONS = ["top", "jungle", "mid", "adc", "support"]
 # ("none" for ARAM, empty string for Arena which takes no position segment).
 POSITIONLESS_MODES = {"aram": "none", "arena": ""}
 
-DDRAGON_VERSIONS = "https://ddragon.leagueoflegends.com/api/versions.json"
+DDRAGON_BASE = "https://ddragon.leagueoflegends.com"
+LOCALE = "en_US"  # Data Dragon locale; affects champion display names
+DDRAGON_VERSIONS = f"{DDRAGON_BASE}/api/versions.json"
 PERKS_URL = (
     "https://raw.communitydragon.org/latest/plugins/"
     "rcp-be-lol-game-data/global/default/v1/perks.json"
@@ -67,14 +70,34 @@ META_URL = "https://lol-api-champion.op.gg/api/global/champions/ranked"
 
 HTTP_TIMEOUT = 20  # seconds, shared by every outbound request
 
+DEFAULT_REGION = "global"  # OP.GG region segment used when none is given
+DEFAULT_MODE = "ranked"  # OP.GG queue mode used when none is given
+
 
 # --------------------------------------------------------------------------- #
 # HTTP helper (stdlib only, so the script has no third-party dependencies)
 # --------------------------------------------------------------------------- #
+class DataFetchError(RuntimeError):
+    """A network or decode failure while fetching JSON, with a readable message.
+
+    HTTPError is deliberately *not* wrapped: callers (e.g. fetch_build) branch on
+    its status code, so it must propagate unchanged. Only the cases that would
+    otherwise surface as a raw stack trace (offline/DNS, malformed JSON) are
+    re-raised as this single, message-carrying type.
+    """
+
+
 def get_json(url: str) -> Any:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-        return json.load(resp)
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError:
+        raise  # status-bearing; callers inspect exc.code, so don't mask it
+    except urllib.error.URLError as exc:
+        raise DataFetchError(f"could not reach {url}: {exc.reason}") from exc
+    except json.JSONDecodeError as exc:
+        raise DataFetchError(f"invalid JSON from {url}: {exc}") from exc
 
 
 def _load_cache(path: str) -> object | None:
@@ -127,46 +150,90 @@ def _slug(name: str) -> str:
 def _fetch_champion_index() -> dict[str, dict]:
     """Download the champion list from Data Dragon and build the name index."""
     version = get_json(DDRAGON_VERSIONS)[0]
-    url = f"https://ddragon.leagueoflegends.com/cdn/{version}/data/en_US/champion.json"
+    url = f"{DDRAGON_BASE}/cdn/{version}/data/{LOCALE}/champion.json"
     data = get_json(url)["data"]
     idx: dict[str, dict] = {}
     for champ in data.values():
-        entry = {
-            "id": int(champ["key"]),  # numeric id OP.GG expects
-            "slug": champ["id"],  # e.g. "MissFortune"
-            "name": champ["name"],  # display name
-        }
+        # A schema change at the data source must skip the bad entry, not discard
+        # the entire index with an unhandled KeyError/ValueError.
+        try:
+            entry = {
+                "id": int(champ["key"]),  # numeric id OP.GG expects
+                "slug": champ["id"],  # e.g. "MissFortune"
+                "name": champ["name"],  # display name
+            }
+        except (KeyError, ValueError, TypeError) as exc:
+            print(f"(warn) skipping malformed champion entry {champ!r}: {exc}")
+            continue
         idx[_slug(champ["name"])] = entry
         idx[_slug(champ["id"])] = entry
     return idx
 
 
+def _cached_reference_data(
+    in_memory: Any,
+    *,
+    refresh: bool,
+    cache_path: str,
+    fetch: Callable[[], Any],
+    decode: Callable[[Any], Any] | None = None,
+    cache_is_fresh: Callable[[str], bool] | None = None,
+) -> tuple[Any, Any]:
+    """Resolve reference data from memory -> local cache -> network.
+
+    Shared by champion_index / perk_names / champion_meta, which differ only in
+    where they fetch from and how their cache is decoded or invalidated:
+
+      * in_memory     -- the caller's current in-memory value (None if unset)
+      * fetch()       -- downloads and builds the data when nothing is cached
+      * decode(raw)   -- optional transform applied to a cache hit (perk_names
+                         restores int keys that JSON stringified)
+      * cache_is_fresh(path) -- optional gate; when it returns False the on-disk
+                         cache is ignored (champion_meta refreshes daily)
+
+    Returns (value, value_to_save): value_to_save is non-None only when the data
+    was just fetched and the caller should persist it (so a cache hit isn't
+    re-written).
+    """
+    if refresh:
+        in_memory = None
+    if in_memory is None and not refresh:
+        if cache_is_fresh is None or cache_is_fresh(cache_path):
+            raw = _load_cache(cache_path)
+            if raw is not None:
+                in_memory = decode(raw) if decode else raw
+    if in_memory is None:
+        fetched = fetch()
+        return fetched, fetched
+    return in_memory, None
+
+
 def champion_index(refresh: bool = False) -> dict[str, dict]:
     """Name index, served from memory -> local cache -> network (in that order)."""
     global _champion_index
-    if refresh:
-        _champion_index = None
-    if _champion_index is None and not refresh:
-        _champion_index = _load_cache(CHAMPIONS_CACHE)
-    if _champion_index is None:
-        _champion_index = _fetch_champion_index()
-        _save_cache(CHAMPIONS_CACHE, _champion_index)
+    _champion_index, to_save = _cached_reference_data(
+        _champion_index,
+        refresh=refresh,
+        cache_path=CHAMPIONS_CACHE,
+        fetch=_fetch_champion_index,
+    )
+    if to_save is not None:
+        _save_cache(CHAMPIONS_CACHE, to_save)
     return _champion_index
 
 
 def perk_names(refresh: bool = False) -> dict[int, str]:
     """Perk/shard id -> name, served from memory -> local cache -> network."""
     global _perk_names
-    if refresh:
-        _perk_names = None
-    if _perk_names is None and not refresh:
-        cached = _load_cache(PERKS_CACHE)
-        # JSON keys are strings; restore int keys.
-        if cached is not None:
-            _perk_names = {int(k): v for k, v in cached.items()}
-    if _perk_names is None:
-        _perk_names = {p["id"]: p["name"] for p in get_json(PERKS_URL)}
-        _save_cache(PERKS_CACHE, _perk_names)
+    _perk_names, to_save = _cached_reference_data(
+        _perk_names,
+        refresh=refresh,
+        cache_path=PERKS_CACHE,
+        fetch=lambda: {p["id"]: p["name"] for p in get_json(PERKS_URL)},
+        decode=lambda raw: {int(k): v for k, v in raw.items()},  # JSON keys are str
+    )
+    if to_save is not None:
+        _save_cache(PERKS_CACHE, to_save)
     return _perk_names
 
 
@@ -182,9 +249,15 @@ def _lookup(name: str, idx: dict[str, dict]) -> dict | None:
     key = _slug(name)
     if key in idx:
         return idx[key]
-    # forgiving prefix match ("kog" -> "Kog'Maw")
-    matches = [v for k, v in idx.items() if k.startswith(key)]
-    return matches[0] if matches else None
+    # Forgiving prefix match ("kog" -> "Kog'Maw"). Dict iteration order must not
+    # decide an ambiguous prefix, so sort candidate slugs by (len, alpha): the
+    # shortest slug wins, ties broken alphabetically, making the result stable.
+    candidate_slugs = sorted(
+        (k for k in idx if k.startswith(key)), key=lambda slug: (len(slug), slug)
+    )
+    if not candidate_slugs:
+        return None
+    return idx[candidate_slugs[0]]
 
 
 def resolve_champion(name: str) -> dict:
@@ -202,12 +275,18 @@ def _fetch_champion_meta() -> dict[str, list[str]]:
     data = get_json(META_URL)["data"]
     meta: dict[str, list[str]] = {}
     for champ in data:
-        positions = sorted(
-            champ.get("positions", []),
-            key=lambda p: p["stats"]["play"],
-            reverse=True,
-        )
-        meta[str(champ["id"])] = [p["name"].lower() for p in positions]
+        # A schema change at the data source must skip the bad entry, not discard
+        # the entire index with an unhandled KeyError/TypeError.
+        try:
+            positions = sorted(
+                champ.get("positions", []),
+                key=lambda p: p.get("stats", {}).get("play", 0),  # tolerate missing stats
+                reverse=True,
+            )
+            meta[str(champ["id"])] = [p["name"].lower() for p in positions]
+        except (KeyError, AttributeError, TypeError) as exc:
+            print(f"(warn) skipping malformed meta entry {champ!r}: {exc}")
+            continue
     return meta
 
 
@@ -218,13 +297,15 @@ def champion_meta(refresh: bool = False) -> dict[str, list[str]]:
     new patches without a manual cache wipe.
     """
     global _champion_meta
-    if refresh:
-        _champion_meta = None
-    if _champion_meta is None and not refresh and _cached_today(META_CACHE):
-        _champion_meta = _load_cache(META_CACHE)
-    if _champion_meta is None:
-        _champion_meta = _fetch_champion_meta()
-        _save_cache(META_CACHE, _champion_meta)
+    _champion_meta, to_save = _cached_reference_data(
+        _champion_meta,
+        refresh=refresh,
+        cache_path=META_CACHE,
+        fetch=_fetch_champion_meta,
+        cache_is_fresh=_cached_today,
+    )
+    if to_save is not None:
+        _save_cache(META_CACHE, to_save)
     return _champion_meta
 
 
@@ -333,7 +414,10 @@ def _build_url(region: str, mode: str, champion_id: int, position: str) -> str:
 
 
 def fetch_build(
-    champion_id: int, position: str, region: str = "global", mode: str = "ranked"
+    champion_id: int,
+    position: str,
+    region: str = DEFAULT_REGION,
+    mode: str = DEFAULT_MODE,
 ) -> Build | None:
     """Runes + summoner spells for one lane, or None if there's no usable build.
 
@@ -344,7 +428,7 @@ def fetch_build(
     try:
         data = get_json(url).get("data", {})
     except urllib.error.HTTPError as exc:
-        if exc.code in (404, 422):
+        if exc.code in (HTTPStatus.NOT_FOUND, HTTPStatus.UNPROCESSABLE_ENTITY):
             return None  # champion is not played in this position
         raise
 
@@ -362,7 +446,10 @@ def fetch_build(
 
 
 def fetch_runes(
-    champion_id: int, position: str, region: str = "global", mode: str = "ranked"
+    champion_id: int,
+    position: str,
+    region: str = DEFAULT_REGION,
+    mode: str = DEFAULT_MODE,
 ) -> list[RunePage]:
     """Convenience wrapper returning just the rune pages for a lane."""
     build = fetch_build(champion_id, position, region, mode)
@@ -371,8 +458,8 @@ def fetch_runes(
 
 def best_build(
     champion_id: int,
-    region: str = "global",
-    mode: str = "ranked",
+    region: str = DEFAULT_REGION,
+    mode: str = DEFAULT_MODE,
     preferred: str | None = None,
 ) -> Build:
     """Build for the champion's lane.
@@ -432,9 +519,13 @@ def main(argv: list[str] | None = None) -> int:
         "--position", choices=POSITIONS, help="Lane (auto-detect if omitted)"
     )
     parser.add_argument(
-        "--region", default="global", help="OP.GG region (default: global)"
+        "--region",
+        default=DEFAULT_REGION,
+        help=f"OP.GG region (default: {DEFAULT_REGION})",
     )
-    parser.add_argument("--mode", default="ranked", help="Queue mode (default: ranked)")
+    parser.add_argument(
+        "--mode", default=DEFAULT_MODE, help=f"game mode (default: {DEFAULT_MODE})"
+    )
     parser.add_argument(
         "--all", action="store_true", help="Show all rune pages, not just the top one"
     )

@@ -48,8 +48,8 @@ def test_arrange_spells(ids, expected):
 
 
 def test_queue_label():
-    assert lcu_watch.queue_label(440) == "Flex"
-    assert lcu_watch.queue_label(2400) == "ARAM Mayhem"
+    assert lcu_watch.queue_label(lcu_watch.QUEUE_FLEX) == "Flex"
+    assert lcu_watch.queue_label(lcu_watch.QUEUE_ARAM_MAYHEM) == "ARAM Mayhem"
     assert lcu_watch.queue_label(999, "SOMEMODE") == "SOMEMODE"  # unknown id -> gameMode
     assert lcu_watch.queue_label(999) == "queue 999"  # nothing known
 
@@ -246,20 +246,22 @@ def test_draft_does_nothing_in_aram(run):
 # Queue setup (async)
 # --------------------------------------------------------------------------- #
 def test_queue_candidates_ranked(run):
-    assert run(lcu_watch.queue_candidates(FakeConnection(), "solo")) == [420]
-    assert run(lcu_watch.queue_candidates(FakeConnection(), "flex")) == [440]
+    assert run(lcu_watch.queue_candidates(FakeConnection(), "solo")) == [lcu_watch.QUEUE_SOLO]
+    assert run(lcu_watch.queue_candidates(FakeConnection(), "flex")) == [lcu_watch.QUEUE_FLEX]
 
 
 def test_queue_candidates_aram_prefers_mayhem_then_fallback(run):
     def handler(method, endpoint, body):
         if "game-queues" in endpoint:
             return FakeResponse(200, [
-                {"id": 2400, "name": "ARAM Mayhem", "description": "", "queueAvailability": "Available"},
-                {"id": 450, "name": "ARAM", "description": "", "queueAvailability": "Available"},
+                {"id": lcu_watch.QUEUE_ARAM_MAYHEM, "name": "ARAM Mayhem", "description": "", "queueAvailability": "Available"},
+                {"id": lcu_watch.QUEUE_ARAM, "name": "ARAM", "description": "", "queueAvailability": "Available"},
             ])
         return None
 
-    assert run(lcu_watch.queue_candidates(FakeConnection(handler), "aram")) == [2400, 450]
+    assert run(lcu_watch.queue_candidates(FakeConnection(handler), "aram")) == [
+        lcu_watch.QUEUE_ARAM_MAYHEM, lcu_watch.QUEUE_ARAM
+    ]
 
 
 def test_set_role_prefs_full_stack_single_role(run):

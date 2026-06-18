@@ -10,3 +10,6 @@ __pycache__
 
 # Generated reference-data cache (champions/perks/meta JSON from opgg_runes)
 .cache
+build/
+dist/
+*.spec
