@@ -31,6 +31,7 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from typing import Any
 
 USER_AGENT = "Mozilla/5.0 (opgg-runes script)"
 
@@ -64,13 +65,15 @@ PERKS_URL = (
 # we can pick a champion's main lane without probing all five lanes.
 META_URL = "https://lol-api-champion.op.gg/api/global/champions/ranked"
 
+HTTP_TIMEOUT = 20  # seconds, shared by every outbound request
+
 
 # --------------------------------------------------------------------------- #
 # HTTP helper (stdlib only, so the script has no third-party dependencies)
 # --------------------------------------------------------------------------- #
-def get_json(url: str) -> object:
+def get_json(url: str) -> Any:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
         return json.load(resp)
 
 
@@ -103,7 +106,13 @@ def _save_cache(path: str, data: object) -> None:
 
 # --------------------------------------------------------------------------- #
 # Reference data: downloaded once, then read from .cache/ on later runs.
-# A cache miss (new champion / new rune id) triggers a single refresh.
+#
+# Two invalidation strategies, by how the data goes stale:
+#   * champion_index / perk_names are miss-based -- champion and rune *names*
+#     only change when something new is added, so we refresh only when a lookup
+#     misses (a new champion/rune id we haven't seen).
+#   * champion_meta is time-based (_cached_today) -- its play/pick stats and lane
+#     assignments shift every patch even with no new ids, so it refreshes daily.
 # --------------------------------------------------------------------------- #
 _champion_index: dict[str, dict] | None = None
 _perk_names: dict[int, str] | None = None
@@ -278,13 +287,16 @@ class RunePage:
     def describe(self) -> str:
         perk_names()  # warm the cache once before the per-id lookups below
         n = perk_name
-        tree = lambda i: RUNE_TREES.get(i, f"#{i}")
+
+        def tree(style_id: int) -> str:
+            return RUNE_TREES.get(style_id, f"#{style_id}")
+
         lines = [
             f"  Primary   [{tree(self.primary_style)}]: "
             + ", ".join(n(i) for i in self.primary_rune_ids),
             f"  Secondary [{tree(self.sub_style)}]: "
             + ", ".join(n(i) for i in self.secondary_rune_ids),
-            f"  Shards            : " + ", ".join(n(i) for i in self.stat_mod_ids),
+            "  Shards            : " + ", ".join(n(i) for i in self.stat_mod_ids),
             f"  Games {self.play:>7,}  |  Winrate {self.winrate:6.1%}"
             f"  |  Pick {self.pick_rate:5.1%}",
         ]
@@ -352,7 +364,7 @@ def fetch_build(
 def fetch_runes(
     champion_id: int, position: str, region: str = "global", mode: str = "ranked"
 ) -> list[RunePage]:
-    """Backwards-compatible helper: just the rune pages for a lane."""
+    """Convenience wrapper returning just the rune pages for a lane."""
     build = fetch_build(champion_id, position, region, mode)
     return build.runes if build else []
 

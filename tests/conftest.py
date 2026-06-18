@@ -65,9 +65,8 @@ def run():
 
 @pytest.fixture(autouse=True)
 def reset_lcu_state():
-    """Clear the watcher's per-session module state before each test."""
-    lcu_watch._handled_actions.clear()
-    lcu_watch._action_attempts.clear()
+    """Clear the watcher's per-session state and caches before each test."""
+    lcu_watch.STATE.reset()
     lcu_watch._champ_names.clear()
     lcu_watch._spell_names.clear()
     lcu_watch.AUTOPILOT = None
